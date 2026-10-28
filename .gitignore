@@ -1,0 +1,207 @@
+
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+.Python
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+.pdm-python
+.pixi/*
+!.pixi/config.toml
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.sample
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ==========================================
+# IntelliJ IDEA / PyCharm (JetBrains)
+# ==========================================
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+gen/
+
+# ==========================================
+# VS Code
+# ==========================================
+.vscode/
+!.vscode/extensions.json
+
+# ==========================================
+# Build & Distribution
+# ==========================================
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ==========================================
+# PyInstaller
+# ==========================================
+*.manifest
+*.spec
+
+# ==========================================
+# Testing & Coverage
+# ==========================================
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.htmlcov/
+cover/
+coverage.xml
+coverage.json
+nosetests.xml
+*.cover
+*.py.cover
+*.lcov
+
+# ==========================================
+# Linting & Type Checking
+# ==========================================
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.dmypy.json
+dmypy.json
+cython_debug/
+
+# ==========================================
+# Local Database
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# ==========================================
+# Logs & Runtime Files
+# ==========================================
+*.log
+logs/
+*.pid
+*.pid.lock
+*.rdb
+*.aof
+celerybeat-schedule*
+celerybeat.pid
+
+# ==========================================
+# Local Storage & Temporary Files
+# ==========================================
+uploads/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# ==========================================
+# Docker
+# ==========================================
+docker-compose.override.yml
+compose.override.yaml
+docker-compose.override.yaml
+compose.override.yml
+
+# ==========================================
+# Documentation
+# ==========================================
+docs/_build/
+site/
+
+# ==========================================
+# Jupyter / IPython
+# ==========================================
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# ==========================================
+# OS Generated Files
+# ==========================================
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+
+# ==========================================
+# Other Python Tools
+# ==========================================
+.spyderproject
+.spyproject
+.ropeproject
+.pybuilder/
+target/
+.scrapy/
+.webassets-cache
+*.mo
+*.pot
+*.sage.py
+.pypirc
+.streamlit/secrets.toml
+
+# ==========================================
+# Profiling
+# ==========================================
+*.prof
+*.profraw
+*.profdata
+
+# ==========================================
+# FastAPI / Application Specific
+# ==========================================
+instance/
+local_settings.py

@@ -1,15 +1,16 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from google.genai import errors
+from google.genai import errors, types
 
 from app.config import Settings
 from app.errors import ServiceError
 from app.examples import example_analysis
-from app.providers.gemini import GeminiAnalyzer
+from app.providers.gemini import GeminiAnalyzer, gemini_response_schema
 from app.schemas import AudioSignals
 
 
@@ -35,7 +36,9 @@ def test_structured_gemini_request_and_evidence_validation():
     assert result.symptoms[0].evidence is None
     config = generate.call_args.kwargs["config"]
     assert config.response_mime_type == "application/json"
-    assert config.response_schema.__name__ == "Situation"
+    assert config.response_schema is None
+    assert config.response_json_schema == gemini_response_schema()
+    assert "temperature" not in config.model_dump(exclude_none=True)
     assert "아버지가 쓰러졌어요" in generate.call_args.kwargs["contents"]
 
 
@@ -51,19 +54,63 @@ def test_malformed_or_blocked_gemini_output(text):
 @pytest.mark.parametrize(
     "status,code",
     [
+        (400, "GEMINI_INVALID_REQUEST"),
         (429, "GEMINI_RATE_LIMITED"),
         (403, "GEMINI_UNAVAILABLE"),
         (404, "GEMINI_UNAVAILABLE"),
         (500, "GEMINI_FAILED"),
+        (503, "GEMINI_FAILED"),
+        (504, "GEMINI_UPSTREAM_TIMEOUT"),
     ],
 )
-def test_upstream_api_errors_are_sanitized(status, code):
+def test_upstream_api_errors_are_sanitized(status, code, caplog):
     failure = errors.APIError(status, {"error": {"message": "sensitive upstream data"}})
     analyzer, _ = analyzer_with_response(error=failure)
     with pytest.raises(ServiceError) as error:
         asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
     assert error.value.code == code
+    if status == 504:
+        assert error.value.status == 504
     assert "sensitive" not in error.value.message
+    assert f"Gemini HTTP {status}" in error.value.message
+    assert f"upstream_http={status}" in caplog.text
+    assert "sensitive" not in caplog.text
+
+
+def test_api_precondition_error_is_distinct_from_request_format_error(caplog):
+    failure = errors.APIError(
+        400,
+        {
+            "error": {
+                "status": "FAILED_PRECONDITION",
+                "message": "sensitive upstream data",
+            }
+        },
+    )
+    analyzer, _ = analyzer_with_response(error=failure)
+    with pytest.raises(ServiceError) as error:
+        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+    assert error.value.code == "GEMINI_PRECONDITION_FAILED"
+    assert "FAILED_PRECONDITION" in error.value.message
+    assert "결제 설정" in error.value.message
+    assert "sensitive" not in error.value.message + caplog.text
+
+
+def test_unrecognized_upstream_status_is_not_exposed(caplog):
+    failure = errors.APIError(
+        500,
+        {
+            "error": {
+                "status": "sensitive transcript",
+                "message": "sensitive key",
+            }
+        },
+    )
+    analyzer, _ = analyzer_with_response(error=failure)
+    with pytest.raises(ServiceError) as error:
+        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+    assert "UNKNOWN" in error.value.message
+    assert "sensitive" not in error.value.message + caplog.text
 
 
 def test_connection_error():
@@ -106,11 +153,27 @@ def test_actual_sdk_client_configuration(monkeypatch):
     analyzer = GeminiAnalyzer(settings)
     client = genai.Client(api_key="not-a-real-key")
     monkeypatch.setattr("app.providers.gemini.genai.Client", lambda **kwargs: client)
-    monkeypatch.setattr(
-        client.aio.models,
-        "generate_content",
-        AsyncMock(return_value=SimpleNamespace(text=example_analysis().analysis.model_dump_json())),
+    transport = AsyncMock(
+        return_value=types.HttpResponse(
+            headers={},
+            body=json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {"text": example_analysis().analysis.model_dump_json()},
+                                ],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ]
+                }
+            ),
+        )
     )
+    monkeypatch.setattr(client._api_client, "async_request", transport)
 
     async def check():
         result = await analyzer.analyze("갑자기 쓰러지셨어요", None, AudioSignals())
@@ -118,3 +181,68 @@ def test_actual_sdk_client_configuration(monkeypatch):
         return result
 
     assert asyncio.run(check()).symptoms[0].evidence == "갑자기 쓰러지셨어요"
+    request = transport.call_args.args[2]
+    generation = request["generationConfig"]
+    assert "responseSchema" not in generation
+    assert generation["responseJsonSchema"] == gemini_response_schema()
+    assert generation["responseMimeType"] == "application/json"
+
+
+def test_schema_omits_complex_generation_constraints_but_keeps_fields_and_enums():
+    schema = gemini_response_schema()
+    serialized = json.dumps(schema)
+    for keyword in ("minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems"):
+        assert keyword not in serialized
+    assert schema["required"] == ["summary", "symptoms", "urgency", "recommended_questions"]
+    assert "collapse" in schema["$defs"]["Symptom"]["properties"]["code"]["enum"]
+
+
+def test_simplified_generation_schema_does_not_relax_server_validation():
+    situation = example_analysis().analysis.model_dump()
+    situation["summary"] = "x" * 1501
+    analyzer, _ = analyzer_with_response(SimpleNamespace(text=json.dumps(situation)))
+    with pytest.raises(ServiceError) as error:
+        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+    assert error.value.code == "INVALID_AI_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "reason", ["API_KEY_INVALID", "API_KEY_EXPIRED", "API_KEY_SERVICE_BLOCKED"]
+)
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_key_rejection_with_http_400_is_not_misreported_as_schema_error(reason, wrapped, caplog):
+    failure = errors.APIError(
+        400,
+        {
+            "error": {
+                "status": "INVALID_ARGUMENT",
+                "message": "sensitive upstream data",
+                "details": [{"reason": reason, "metadata": {"key": "sensitive-key"}}],
+            }
+        },
+    )
+    if not wrapped:
+        failure.details = failure.details["error"]
+    analyzer, _ = analyzer_with_response(error=failure)
+    with pytest.raises(ServiceError) as error:
+        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+    assert error.value.code == "GEMINI_API_KEY_REJECTED"
+    assert reason in error.value.message
+    assert "sensitive" not in error.value.message + caplog.text
+
+
+def test_schema_rejection_is_classified_without_echoing_provider_message(caplog):
+    failure = errors.APIError(
+        400,
+        {
+            "error": {
+                "status": "INVALID_ARGUMENT",
+                "message": "response_schema: too many states. sensitive transcript",
+            }
+        },
+    )
+    analyzer, _ = analyzer_with_response(error=failure)
+    with pytest.raises(ServiceError) as error:
+        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+    assert error.value.code == "GEMINI_SCHEMA_REJECTED"
+    assert "sensitive" not in error.value.message + caplog.text

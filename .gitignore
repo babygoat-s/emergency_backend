@@ -205,3 +205,10 @@ target/
 # ==========================================
 instance/
 local_settings.py
+
+# Local AI model assets
+models/*.pt
+models/*.pth
+models/*.safetensors
+models/tokenizer/
+models/labels.json

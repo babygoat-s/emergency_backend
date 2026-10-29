@@ -11,7 +11,7 @@ class Settings(BaseSettings):
         env_file=ROOT / ".env", env_file_encoding="utf-8", extra="ignore"
     )
     gemini_api_key: SecretStr = SecretStr("")
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
     gemini_timeout_seconds: float = Field(default=45, gt=0, le=300)
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     max_upload_mb: int = Field(default=50, ge=1, le=100)

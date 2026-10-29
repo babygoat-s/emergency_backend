@@ -1,4 +1,5 @@
-// Import this helper from the future React/Vite frontend. No UI or storage is included.
+// Standalone browser integration example; no UI or storage is included.
+// The React/Vite app has its own client in emergency_frontend/src/audio/realtime.js.
 // Microphone access requires localhost or HTTPS.
 export async function startRealtimeAnalysis({
   url = "ws://127.0.0.1:8000/api/v1/analysis/realtime",

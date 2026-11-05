@@ -1,0 +1,1 @@
+-e .[stt,symptom,speaker,rag]

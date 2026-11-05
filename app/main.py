@@ -33,7 +33,8 @@ def create_app(settings: Settings | None = None, service: AnalysisService | None
         version="0.2.0",
         description=(
             "연속 PCM 실시간 분석과 파일 전체 분석을 제공합니다. "
-            "전사·화자·음성 상태·증상·Gemini 질문 추천을 통합하며 DB는 사용하지 않습니다."
+            "전사·화자·증상·매뉴얼 근거 질문 추천을 통합합니다. "
+            "대화 기록은 저장하지 않으며 매뉴얼 인덱스는 로컬 ChromaDB에 저장합니다."
         ),
         lifespan=lifespan,
     )

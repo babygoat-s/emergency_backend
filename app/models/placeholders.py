@@ -7,7 +7,7 @@
 
 from app.audio import AudioInput
 from app.errors import ServiceError
-from app.schemas import AudioSignals, SpeakerSpan, Symptom, Transcript
+from app.schemas import SpeakerSpan, Symptom, Transcript
 
 
 class SpeechModel:
@@ -35,19 +35,6 @@ class SpeakerModel:
         # state에 임베딩 등을 보관하여 창이 바뀌어도 speaker_id를 유지하세요.
         # role은 실제 역할 분류가 가능한 경우에만 caller/operator로 지정합니다.
         return None
-
-
-class VoiceStateModel:
-    name = "voice-state-not-connected"
-
-    def __init__(self, settings):
-        # TODO: Wav2Vec2 등 음성 상태 모델 로드.
-        pass
-
-    def analyze(self, audio: AudioInput) -> AudioSignals:
-        # 임시 출력: available, speaking_rate_per_minute, crying_detected,
-        # breathing_distress_detected. 확인되지 않은 값은 None입니다.
-        return AudioSignals()
 
 
 class SymptomModel:

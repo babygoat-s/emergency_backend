@@ -6,7 +6,7 @@
 
 `AudioInput` (`app/audio.py`):
 
-- `pcm: bytes`: 16,000 Hz, mono, signed 16-bit little-endian PCM. 실시간은 기본 최대 6초(192,000 bytes), 파일은 정규화된 전체 음성.
+- `pcm: bytes`: 16,000 Hz, mono, signed 16-bit little-endian PCM. 실시간 새 음성은 기본 최대 6초(192,000 bytes), 파일은 정규화된 전체 음성. Whisper에는 이전 음성 최대 6초를 추가해 문맥을 보존하며 중복 구간은 타임스탬프로 제외합니다.
 - `sample_rate: int`: 현재 16,000 고정.
 - `start_seconds: float`: 실시간 창의 세션 내 시작 시각. 파일은 0.
 - `duration_seconds: float`: 입력 PCM 길이에서 계산한 실제 길이.
@@ -46,24 +46,7 @@ Transcript(
 
 분류를 사용할 수 없으면 `None`, 감지된 발화가 없으면 `[]`를 반환합니다. 사용자 정의 화자 어댑터에는 연결별 `state`가 제공됩니다.
 
-## 3. 음성 상태 — VoiceStateModel.analyze(audio) -> AudioSignals
-
-입력: 공통 `AudioInput`.
-
-임시 출력:
-
-```python
-AudioSignals(
-    available=True, provider="colab-voice-state-v1",
-    speaking_rate_per_minute=120.0,
-    crying_detected=False,
-    breathing_distress_detected=True,
-)
-```
-
-말속도 단위는 임시로 분당 음절 수입니다. 모델에서 지원하지 않는 값은 None으로 둡니다. 모델 미연결은 `AudioSignals(available=False)`입니다. 실시간에서 이 결과는 최신 입력 창에만 해당하며 파일에서는 전체 파일에 해당합니다.
-
-## 4. 텍스트 증상 — KoElectraClassifier.predict(text) -> list[Symptom]
+## 3. 텍스트 증상 — KoElectraClassifier.predict(text) -> list[Symptom]
 
 입력: 누적 STT 텍스트(str, 최대 20,000자). 파일은 전체 전사 텍스트입니다.
 
@@ -79,7 +62,7 @@ AudioSignals(
 
 ## Gemini
 
-STT 결과, 선택적인 로컬 증상, 음성 상태로 상황 요약·긴급도·다음 질문을 생성합니다. 이 부분은 Colab 모델이 아니라 `app/providers/gemini.py`의 실제 API 연동 코드입니다. 원본 오디오는 Gemini로 전송하지 않습니다. 질문 생성에는 전사 결과가 필요하므로 STT와 완전히 독립적으로 시작할 수는 없습니다.
+STT 결과와 선택적인 로컬 증상으로 상황 요약·긴급도·다음 질문을 생성합니다. 이 부분은 Colab 모델이 아니라 `app/providers/gemini.py`의 실제 API 연동 코드입니다. 원본 오디오는 Gemini로 전송하지 않습니다. 질문 생성에는 전사 결과가 필요하므로 STT와 완전히 독립적으로 시작할 수는 없습니다.
 
 `CLASSIFIER_FACTORY`는 사용자 정의 분류기를 지정할 때 사용하며 `SYMPTOM_MODEL_PATH`보다 우선합니다. 로컬 분류기가 연결된 경우 최종 증상은 로컬 결과를 사용하고 Gemini는 긴급도·요약·질문을 생성합니다. 기본 Gemini 모델은 `gemini-3.5-flash-lite`입니다.
 
@@ -87,4 +70,4 @@ Gemini의 응답은 `Situation`으로 검증합니다. 허용된 증상 코드�
 서버 사전으로 교정하며, 원문에 없는 증상 인용은 제거합니다. Gemini 증상의 `score`는
 항상 `None`이며 모델 신뢰도나 임상 확률을 생성하지 않습니다. 전송용 JSON Schema는
 기본 구조만 포함하고 길이·개수·중복 등의 세부 제한은 서버에서 검증합니다.
-RAG나 공식 응급 매뉴얼 검색은 연결되지 않았으며 `manual_grounded=False`입니다.
+RAG 모드는 로컬 매뉴얼 검색과 LangChain LLM을 연결합니다. 긴급도 단계는 LLM 응답에서만 가져옵니다. 설치와 계약은 `docs/RAG.md`를 참고하세요.

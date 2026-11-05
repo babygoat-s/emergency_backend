@@ -76,3 +76,67 @@ def test_whisper_receives_normalized_audio_and_reuses_model(monkeypatch):
         assert result.text == "도와주세요"
         assert result.segments[0].end == 1
     assert calls == [1]
+
+
+@pytest.mark.parametrize("realtime", [False, True])
+def test_old_hotword_environment_cannot_seed_transcription(monkeypatch, realtime):
+    monkeypatch.setenv("WHISPER_HOTWORDS", "신고 의식 호흡 구토 두통 출혈")
+    calls = []
+    settings = Settings(_env_file=None)
+    stt = WhisperTranscriber(settings)
+
+    def decode(waveform, **kwargs):
+        calls.append(kwargs)
+        return iter(
+            [SimpleNamespace(start=0, end=1, text="구토와 출혈이 있어요.")]
+        ), SimpleNamespace(language="ko")
+
+    stt._model = SimpleNamespace(transcribe=decode)
+    result = stt.transcribe(decode_upload(wave_bytes(), 600), "ko", realtime=realtime)
+    assert result.text == "구토와 출혈이 있어요."
+    assert "whisper_hotwords" not in Settings.model_fields
+    assert calls[0]["hotwords"] is None
+    assert calls[0]["initial_prompt"] is None
+    assert calls[0]["prefix"] is None
+    assert calls[0]["condition_on_previous_text"] is False
+    if realtime:
+        assert calls[0]["temperature"] == 0
+    else:
+        # Long file decoding must be able to recover from low-confidence decoding.
+        assert len(calls[0]["temperature"]) > 1
+        assert calls[0]["vad_parameters"] is None
+
+
+def test_overlap_recovery_also_has_no_text_prompt(monkeypatch):
+    monkeypatch.setenv("WHISPER_HOTWORDS", "신고 의식 호흡 구토 두통 출혈")
+    stt = WhisperTranscriber(Settings(_env_file=None))
+    calls = []
+
+    def decode(waveform, **kwargs):
+        calls.append(kwargs)
+        text = "이전 발화" if len(calls) == 1 else "삼호선 삼번 출구입니다."
+        return iter(
+            [
+                SimpleNamespace(
+                    start=0,
+                    end=0.8,
+                    text=text,
+                    words=[],
+                )
+            ]
+        ), SimpleNamespace(language="ko", duration_after_vad=1.0)
+
+    stt._model = SimpleNamespace(transcribe=decode)
+    audio = decode_upload(wave_bytes(seconds=2), 600)
+    result = stt.transcribe(
+        audio,
+        "ko",
+        word_cutoff=1.0,
+        context_samples=16000,
+        realtime=True,
+    )
+    assert len(calls) == 2
+    assert result.text == "삼호선 삼번 출구입니다."
+    assert all(
+        call[key] is None for call in calls for key in ("hotwords", "initial_prompt", "prefix")
+    )

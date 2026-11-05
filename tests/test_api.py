@@ -10,7 +10,6 @@ from app.schemas import Transcript
 from app.services import AnalysisService
 from tests.conftest import (
     FakeAnalyzer,
-    FakeAudioAnalyzer,
     FakeClassifier,
     FakeDiarizer,
     FakeTranscriber,
@@ -28,6 +27,9 @@ def test_health_config_and_example_without_key(settings):
             "storage": "none",
         }
         config = client.get("/api/v1/analysis/config").json()
+        assert "audio_analyzer" not in config
+        schemas = client.get("/openapi.json").json()["components"]["schemas"]
+        assert "AudioSignals" not in schemas
         assert config["history_enabled"] is False
         assert config["streaming_mode"] == "pcm_s16le"
         assert config["diarizer"] == "speaker-not-connected"
@@ -53,6 +55,9 @@ def test_paths_are_grouped_and_old_endpoints_are_removed(backend):
         "/api/v1/health",
         "/api/v1/analysis/config",
         "/api/v1/analysis/example",
+        "/api/v1/rag/recommend",
+        "/api/v1/rag/status",
+        "/api/v1/rag/sources/{document_id}",
         PATH,
     }
     assert "multipart/form-data" in paths[PATH]["post"]["requestBody"]["content"]
@@ -70,7 +75,7 @@ def test_file_is_analyzed_once_as_a_whole(backend):
     assert len(backend.transcriber.calls) == len(backend.analyzer.calls) == 1
     assert backend.transcriber.calls[0][0].duration_seconds == 4
     assert backend.transcriber.calls[0][1] == "auto"
-    assert body["audio_signals"]["available"] is False
+    assert "audio_signals" not in body
     assert body["speakers"]["available"] is False
     assert body["transcript"]["segments"][0]["speaker"] == "unknown"
     assert body["manual_grounded"] is False
@@ -128,14 +133,13 @@ def test_missing_gemini_key_is_explicit(settings):
         assert response.json()["error"]["code"] == "GEMINI_NOT_CONFIGURED"
 
 
-def test_model_slots_are_used_for_both_audio_features_and_symptoms(settings):
+def test_model_slots_are_used_for_speakers_and_symptoms(settings):
     analyzer = FakeAnalyzer()
     service = AnalysisService(
         settings,
         transcriber=FakeTranscriber(),
         analyzer=analyzer,
         classifier=FakeClassifier(),
-        audio_analyzer=FakeAudioAnalyzer(),
         diarizer=FakeDiarizer(),
     )
     with TestClient(create_app(settings, service)) as client:
@@ -143,7 +147,7 @@ def test_model_slots_are_used_for_both_audio_features_and_symptoms(settings):
     assert body["symptom_provider"] == "test-symptom"
     assert len(body["symptoms"]) == 1
     assert body["symptoms"] == body["analysis"]["symptoms"]
-    assert body["audio_signals"]["crying_detected"] is True
+    assert "audio_signals" not in body
     assert body["speakers"]["segments"][0]["speaker_id"] == "speaker_0"
     assert body["transcript"]["segments"][0]["speaker"] == "caller"
     assert analyzer.calls[0][1][0].score == 0.92
@@ -197,10 +201,10 @@ def test_segment_validation():
         Transcript(text="말", provider="test", segments=[{"start": 3, "end": 1, "text": "말"}])
 
 
-def test_three_audio_models_run_concurrently(settings):
+def test_transcription_and_speakers_run_concurrently(settings):
     import threading
 
-    barrier = threading.Barrier(3, timeout=2)
+    barrier = threading.Barrier(2, timeout=2)
 
     class STT(FakeTranscriber):
         def transcribe(self, audio, language):
@@ -212,13 +216,7 @@ def test_three_audio_models_run_concurrently(settings):
             barrier.wait()
             return super().diarize(audio, state)
 
-    class Voice(FakeAudioAnalyzer):
-        def analyze(self, audio):
-            barrier.wait()
-            return super().analyze(audio)
-
-    service = AnalysisService(
-        settings, transcriber=STT(), diarizer=Speakers(), audio_analyzer=Voice()
-    )
+    service = AnalysisService(settings, transcriber=STT(), diarizer=Speakers())
     result = asyncio.run(service.local_analysis(AudioInput(pcm=b"\x01\x00" * 8000), "ko", {}))
-    assert result.speakers.available and result.audio_signals.available
+    assert result.speakers.available
+    assert "audio_signals" not in result.model_dump()

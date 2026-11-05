@@ -11,7 +11,6 @@ from app.config import Settings
 from app.errors import ServiceError
 from app.examples import example_analysis
 from app.providers.gemini import GeminiAnalyzer, gemini_response_schema
-from app.schemas import AudioSignals
 
 
 def analyzer_with_response(response=None, error=None):
@@ -31,7 +30,7 @@ def test_structured_gemini_request_and_evidence_validation():
     situation.symptoms[0].score = 0.999
     situation.symptoms[0].evidence = "원문에 없는 문장"
     analyzer, generate = analyzer_with_response(SimpleNamespace(text=situation.model_dump_json()))
-    result = asyncio.run(analyzer.analyze(example.transcript.text, None, AudioSignals()))
+    result = asyncio.run(analyzer.analyze(example.transcript.text, None))
     assert result.symptoms[0].label == "고열"
     assert result.symptoms[0].score is None
     assert result.symptoms[0].evidence is None
@@ -49,7 +48,7 @@ def test_structured_gemini_request_and_evidence_validation():
 def test_malformed_or_blocked_gemini_output(text):
     analyzer, _ = analyzer_with_response(SimpleNamespace(text=text))
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.status == 502
     assert error.value.code == "INVALID_AI_RESPONSE"
 
@@ -70,7 +69,7 @@ def test_upstream_api_errors_are_sanitized(status, code, caplog):
     failure = errors.APIError(status, {"error": {"message": "sensitive upstream data"}})
     analyzer, _ = analyzer_with_response(error=failure)
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.code == code
     if status == 504:
         assert error.value.status == 504
@@ -88,7 +87,7 @@ def test_overload_backs_off_and_recovers_with_one_probe(monkeypatch, caplog):
     analyzer, generate = analyzer_with_response(error=failure)
 
     async def analyze():
-        return await analyzer.analyze("증상", None, AudioSignals())
+        return await analyzer.analyze("증상", None)
 
     async def overloaded():
         with pytest.raises(ServiceError) as error:
@@ -142,7 +141,7 @@ def test_api_precondition_error_is_distinct_from_request_format_error(caplog):
     )
     analyzer, _ = analyzer_with_response(error=failure)
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.code == "GEMINI_PRECONDITION_FAILED"
     assert "FAILED_PRECONDITION" in error.value.message
     assert "결제 설정" in error.value.message
@@ -161,7 +160,7 @@ def test_unrecognized_upstream_status_is_not_exposed(caplog):
     )
     analyzer, _ = analyzer_with_response(error=failure)
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert "UNKNOWN" in error.value.message
     assert "sensitive" not in error.value.message + caplog.text
 
@@ -169,7 +168,7 @@ def test_unrecognized_upstream_status_is_not_exposed(caplog):
 def test_connection_error():
     analyzer, _ = analyzer_with_response(error=httpx.ConnectError("sensitive"))
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.code == "GEMINI_CONNECTION_FAILED"
 
 
@@ -181,7 +180,7 @@ def test_newer_sdk_transport_errors():
     ]:
         analyzer, _ = analyzer_with_response(error=failure)
         with pytest.raises(ServiceError) as error:
-            asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+            asyncio.run(analyzer.analyze("증상", None))
         assert error.value.code == code
 
 
@@ -194,7 +193,7 @@ def test_gemini_timeout():
 
     generate.side_effect = delayed
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.status == 504
 
 
@@ -230,7 +229,7 @@ def test_actual_sdk_client_configuration(monkeypatch):
     monkeypatch.setattr(client._api_client, "async_request", transport)
 
     async def check():
-        result = await analyzer.analyze(example.transcript.text, None, AudioSignals())
+        result = await analyzer.analyze(example.transcript.text, None)
         await analyzer.close()
         return result
 
@@ -264,7 +263,7 @@ def test_simplified_generation_schema_does_not_relax_server_validation():
     situation["summary"] = "x" * 1501
     analyzer, _ = analyzer_with_response(SimpleNamespace(text=json.dumps(situation)))
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.code == "INVALID_AI_RESPONSE"
 
 
@@ -287,7 +286,7 @@ def test_key_rejection_with_http_400_is_not_misreported_as_schema_error(reason, 
         failure.details = failure.details["error"]
     analyzer, _ = analyzer_with_response(error=failure)
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.code == "GEMINI_API_KEY_REJECTED"
     assert reason in error.value.message
     assert "sensitive" not in error.value.message + caplog.text
@@ -305,6 +304,6 @@ def test_schema_rejection_is_classified_without_echoing_provider_message(caplog)
     )
     analyzer, _ = analyzer_with_response(error=failure)
     with pytest.raises(ServiceError) as error:
-        asyncio.run(analyzer.analyze("증상", None, AudioSignals()))
+        asyncio.run(analyzer.analyze("증상", None))
     assert error.value.code == "GEMINI_SCHEMA_REJECTED"
     assert "sensitive" not in error.value.message + caplog.text

@@ -19,7 +19,6 @@ from app.providers.gemini import (
     GeminiAnalyzer,
     gemini_api_error,
 )
-from app.schemas import AudioSignals
 
 
 def timeout_description(error: Exception) -> str:
@@ -85,7 +84,6 @@ async def check(timeout_seconds: float | None = None, model: str | None = None) 
         await analyzer.analyze(
             "연동 확인을 위한 가상 신고입니다. 환자가 넘어졌다고 합니다.",
             None,
-            AudioSignals(),
         )
         print(f"PASS: {stage} ({time.monotonic() - started:.1f}초)")
         return 0

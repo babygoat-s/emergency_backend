@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.examples import example_analysis
 from app.main import create_app
-from app.schemas import AudioSignals, SpeakerSpan, Symptom, Transcript
+from app.schemas import SpeakerSpan, Symptom, Transcript
 from app.services import AnalysisService
 
 
@@ -36,8 +36,8 @@ class FakeAnalyzer:
         self.calls = []
         self.started = threading.Event()
 
-    async def analyze(self, text, symptoms, signals):
-        self.calls.append((text, symptoms, signals))
+    async def analyze(self, text, symptoms):
+        self.calls.append((text, symptoms))
         self.started.set()
         return example_analysis().analysis
 
@@ -47,13 +47,6 @@ class FakeClassifier:
 
     def predict(self, text):
         return [Symptom(code="collapse", label="쓰러짐", score=0.92)]
-
-
-class FakeAudioAnalyzer:
-    name = "test-voice-state"
-
-    def analyze(self, audio):
-        return AudioSignals(available=True, provider=self.name, crying_detected=True)
 
 
 class FakeDiarizer:

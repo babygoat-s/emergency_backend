@@ -1,0 +1,20 @@
+[
+  {
+    "case": "subway_call_local_sample",
+    "mode": "previous_hotwords",
+    "audio_seconds": 40.27,
+    "processing_seconds": 62.813,
+    "character_error_rate": 0.4466,
+    "prompt_echo_windows": 1,
+    "prompt_sequence_in_reference": false
+  },
+  {
+    "case": "subway_call_local_sample",
+    "mode": "no_text_prompt",
+    "audio_seconds": 40.27,
+    "processing_seconds": 53.766,
+    "character_error_rate": 0.3544,
+    "prompt_echo_windows": 0,
+    "prompt_sequence_in_reference": false
+  }
+]

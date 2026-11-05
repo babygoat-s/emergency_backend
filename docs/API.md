@@ -7,6 +7,11 @@
 | 분석 설정 조회 | GET | `/api/v1/analysis/config` |
 | 고정 분석 예시 조회 | GET | `/api/v1/analysis/example` |
 | 서버 상태 확인 | GET | `/api/v1/health` |
+| 텍스트 상담 후속 질문 | POST | `/api/v1/rag/recommend` |
+| 매뉴얼 인덱스 현황 | GET | `/api/v1/rag/status` |
+| 인덱싱한 근거 PDF | GET | `/api/v1/rag/sources/{document_id}` |
+
+RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니다. `RAG_ENABLED=true`에서 파일·실시간 응답은 `rag`에 원문 질문·상태·근거를 포함합니다. `manual_grounded`는 실제 근거 질문이 있을 때 true이며, `analysis.recommended_questions`도 같은 근거에 연결된 LLM 질문을 사용합니다. 근거가 부족하면 질문 목록이 비어 있을 수 있습니다. RAG의 긴급·응급·비응급은 오래된 원문의 연구용 참고 분류이며 의료 전문가 검증이 필요합니다.
 
 ## 녹음 파일 전체 분석 — POST /api/v1/analysis/file
 
@@ -81,13 +86,6 @@
     "provider": null,
     "segments": []
   },
-  "audio_signals": {
-    "available": false,
-    "provider": null,
-    "speaking_rate_per_minute": null,
-    "crying_detected": null,
-    "breathing_distress_detected": null
-  },
   "symptoms": [
     {
       "code": "collapse",
@@ -110,8 +108,7 @@
   "warnings": [
     "AI 결과는 신고접수 담당자의 판단 보조 정보이며 확정 진단이나 출동 결정이 아닙니다.",
     "공식 응급 매뉴얼 검색 자료가 연결되지 않아 질문은 매뉴얼 근거가 검증되지 않았습니다.",
-    "화자 분류 결과를 사용할 수 없어 화자는 unknown으로 표시합니다.",
-    "음성 상태 모델 미연결: 호흡·울음·말속도 값은 null입니다."
+    "화자 분류 결과를 사용할 수 없어 화자는 unknown으로 표시합니다."
   ]
 }
 ```
@@ -124,17 +121,17 @@
 | `transcript.segments[].speaker` | `caller`, `operator`, `unknown` |
 | `analysis` | 상황 요약·증상·긴급도·확인 질문 객체; 실시간 처리 중 또는 실패 시 `null` |
 | `analysis.urgency.level` | `minimal`(최하), `low`(하), `moderate`(중), `high`(상), `critical`(최상). 판단에 필요한 정보가 부족하면 `unknown`(판단 보류) |
-| `analysis.recommended_questions` | `{question: string, purpose: string}` 배열, 1~5개 |
+| `analysis.recommended_questions` | `{question: string, purpose: string}` 배열. RAG는 0~3개, 기존 Gemini 경로는 1~5개 |
 | `symptoms` | `{code, label, evidence, score}` 배열, 최대 10개; 완료 시 `analysis.symptoms`와 동일 |
 | `symptoms[].code` | KoELECTRA는 `fever`, `nausea_vomiting`, `headache`, `abdominal_pain`, `dizziness`, `laceration`, `general_weakness`, `breathing_difficulty` 반환. 기존 코드 `collapse`, `suspected_no_breathing`, `altered_consciousness`, `chest_pain`, `bleeding`, `seizure`, `burn`, `trauma`, `other`도 허용 |
 | `symptoms[].evidence` | string 또는 `null` |
 | `symptoms[].score` | 0~1 또는 `null`; Gemini 추출은 `null` |
-| `local_questions` | 실시간 새 발화의 기본 확인 질문 `{question, purpose}` 배열. 파일 분석에서는 기본 빈 배열 |
+| `local_questions` | `{question, purpose}` 배열. RAG에서는 원문 질문, 기존 실시간 경로에서는 기본 확인 질문 |
 | `speakers.segments` | `{start: number, end: number, speaker_id: string, role: caller/operator/unknown}` 배열. Wav2Vec2의 `speaker_0`, `speaker_1`은 분류 클래스 ID |
-| `audio_signals` | 모델 미연결 시 `available=false`, 나머지 값은 `null` |
 | `symptom_provider` | string 또는 `null` |
 | `analysis_provider` | string; 설정된 분석 모델에 따라 달라짐 |
-| `manual_grounded` | `false` |
+| `manual_grounded` | 원문 근거 질문이 있을 때 `true` |
+| `rag` | RAG 상태·질문·근거·검토 정보 또는 `null` |
 | `requires_operator_review` | `true` |
 | `warnings` | string 배열 |
 
@@ -196,7 +193,7 @@ JSON text 메시지:
 
 `data`는 파일 분석의 `AnalysisResponse`와 같은 구조입니다. `sequence`는 입력 구간 번호이며 같은 구간의 `audio`와 `analysis`는 같은 번호입니다. 서로 다른 구간의 응답은 순서가 바뀔 수 있습니다. `window.start/end`와 모든 발화 시간은 세션 시작 기준 초입니다.
 
-`audio` 단계는 `analysis=null`, 새 발화가 있으면 `status=pending`과 `local_questions`를 보내며, 없으면 `status=no_speech`입니다. 전사와 화자 구간은 누적되고 음성 상태는 최근 `window` 구간의 값입니다. 경계에서 복구한 전사 타임스탬프는 직전 `window`에 걸칠 수 있습니다. `analysis` 단계는 완료 시 `status=completed`, 실패 시 `status=unavailable`, `analysis=null`입니다. 상황 분석 실패 시 연결과 기본 확인 질문은 유지됩니다.
+`audio` 단계는 `analysis=null`, 새 발화가 있으면 `status=pending`과 `local_questions`를 보내며, 없으면 `status=no_speech`입니다. 전사와 화자 구간은 누적됩니다. 경계에서 복구한 전사 타임스탬프는 직전 `window`에 걸칠 수 있습니다. `analysis` 단계는 완료 시 `status=completed`, 실패 시 `status=unavailable`, `analysis=null`입니다. 상황 분석 실패 시 연결과 기본 확인 질문은 유지됩니다.
 
 녹음 중 상황 분석은 `realtime_analysis_min_interval_seconds` 이상의 간격으로 최신 누적 전사를 사용합니다. Gemini 503 이후에는 대기 시간이 지난 뒤 최신 전사를 한 번 재시도하므로 같은 `sequence`의 `analysis` 이벤트가 오류와 성공으로 각각 도착할 수 있습니다. 종료 시 503 대기가 남아 있으면 기본 질문을 남기고 `finished`를 반환합니다.
 
@@ -250,12 +247,11 @@ JSON text 메시지:
     "symptom_labels": ["고열", "구토·오심", "두통"]
   },
   "situation_analyzer": "gemini:gemini-3.5-flash-lite",
-  "audio_analyzer": "voice-state-not-connected",
   "history_enabled": false,
   "manual_grounded": false,
   "streaming_mode": "pcm_s16le",
   "realtime_window_seconds": 6.0,
-  "realtime_analysis_timeout_seconds": 15.0,
+  "realtime_analysis_timeout_seconds": 25.0,
   "realtime_analysis_min_interval_seconds": 10.0,
   "realtime_sample_rate": 16000,
   "realtime_channels": 1
@@ -304,3 +300,8 @@ JSON text 메시지:
 ```
 
 `gemini_configured`는 키 입력 여부를 나타내는 boolean이며, 실제 모델 실행이나 외부 API 호출 성공 여부를 나타내지는 않습니다.
+
+
+RAG LLM은 LangChain으로 연결합니다. `rag.summary`는 LLM 종합 요약이며 실패 시 null이고 발화를 대신 넣지 않습니다. `rag.summary_provider`는 llm/pending/unavailable/disabled입니다. `rag.urgency`는 level/reason/evidence/origin으로 검토용 5단계 제안과 발화 근거를 제공합니다. 음성 응답의 `analysis.urgency`도 이 제안을 사용합니다. `rag.retry_after_seconds`는 재시도 대기 시간, `rag.llm_model`은 성공한 모델입니다. 실시간 update의 `processing_lag_seconds`는 아직 전사하지 못한 입력 길이입니다. 이는 연결 종료 오류가 아닙니다.
+
+음성 상태 추정 계약은 제거했습니다. 응답과 설정에는 해당 필드가 없습니다. `rag.urgency.origin`은 llm 또는 unavailable이며, llm이 아닌 경우 5단계 결과를 표시하지 않습니다. 유효한 결과를 얻기 전의 분석 대기·미완료와 LLM이 정보 부족으로 반환한 unknown(판단 보류)을 구분합니다.

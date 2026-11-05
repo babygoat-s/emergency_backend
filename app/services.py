@@ -9,10 +9,9 @@ from app.audio import BYTES_PER_SECOND, AudioInput, decode_upload
 from app.config import Settings
 from app.errors import ServiceError
 from app.models.koelectra import KoElectraClassifier
-from app.models.placeholders import SpeakerModel, SymptomModel, VoiceStateModel
+from app.models.placeholders import SpeakerModel, SymptomModel
 from app.models.wav2vec2_speakers import Wav2Vec2Diarizer
 from app.providers.base import (
-    AudioAnalyzer,
     Diarizer,
     SituationAnalyzer,
     SymptomClassifier,
@@ -20,7 +19,17 @@ from app.providers.base import (
 )
 from app.providers.gemini import GeminiAnalyzer
 from app.providers.whisper import WhisperTranscriber
-from app.schemas import AnalysisResponse, Segment, SpeakerAnalysis, SpeakerSpan, Transcript
+from app.rag.engine import RagEngine
+from app.rag.schemas import Turn
+from app.schemas import (
+    AnalysisResponse,
+    Question,
+    Segment,
+    Situation,
+    SpeakerAnalysis,
+    SpeakerSpan,
+    Transcript,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +60,6 @@ class AnalysisService:
         transcriber: Transcriber | None = None,
         analyzer: SituationAnalyzer | None = None,
         classifier: SymptomClassifier | None = None,
-        audio_analyzer: AudioAnalyzer | None = None,
         diarizer: Diarizer | None = None,
     ):
         self.settings = settings
@@ -73,18 +81,14 @@ class AnalysisService:
         self.diarizer = provider(diarizer, settings.diarizer_factory, diarizer_default)
         classifier_default = KoElectraClassifier if settings.symptom_model_path else SymptomModel
         self.classifier = provider(classifier, settings.classifier_factory, classifier_default)
-        self.audio_analyzer = provider(
-            audio_analyzer, settings.audio_analyzer_factory, VoiceStateModel
-        )
         self.analyzer = analyzer or GeminiAnalyzer(settings)
+        self.rag = RagEngine(settings)
         self._audio_slots = asyncio.Semaphore(settings.max_concurrent_inferences)
         self._classifier_slots = asyncio.Semaphore(1)
 
     async def warm_models(self):
         models = []
-        if self.settings.whisper_realtime_model and isinstance(
-            self.realtime_transcriber, WhisperTranscriber
-        ):
+        if isinstance(self.realtime_transcriber, WhisperTranscriber):
             models.append(self.realtime_transcriber)
         if isinstance(self.diarizer, Wav2Vec2Diarizer):
             models.append(self.diarizer)
@@ -95,6 +99,11 @@ class AnalysisService:
                 await run_in_threadpool(model.warmup)
             except ServiceError as exc:
                 logger.warning("Model warmup failed: %s (%s)", model.name, exc.code)
+        if self.settings.rag_enabled:
+            try:
+                await run_in_threadpool(self.rag.warmup)
+            except Exception as exc:
+                logger.warning("RAG warmup unavailable (%s)", type(exc).__name__)
 
     @asynccontextmanager
     async def slot(self, semaphore: asyncio.Semaphore | None = None):
@@ -129,20 +138,24 @@ class AnalysisService:
             if realtime and isinstance(transcriber, WhisperTranscriber):
                 context_seconds = len(stt_context) / BYTES_PER_SECOND
                 stt_audio = AudioInput(pcm=stt_context + audio.pcm)
-                cutoff = max(0.0, committed_end - (audio.start_seconds - context_seconds))
+                cutoff = (
+                    max(0.0, committed_end - (audio.start_seconds - context_seconds))
+                    if stt_context
+                    else None
+                )
                 stt = run_in_threadpool(
                     transcriber.transcribe,
                     stt_audio,
                     language,
                     word_cutoff=cutoff,
                     context_samples=len(stt_context) // 2,
+                    realtime=True,
                 )
             else:
                 stt = run_in_threadpool(transcriber.transcribe, audio, language)
-            transcript, spans, signals = await asyncio.gather(
+            transcript, spans = await asyncio.gather(
                 stt,
                 run_in_threadpool(self.diarizer.diarize, audio, speaker_state),
-                run_in_threadpool(self.audio_analyzer.analyze, audio),
             )
         transcript = Transcript.model_validate(transcript)
         # Measured duration includes silence, preventing timestamp drift.
@@ -165,17 +178,14 @@ class AnalysisService:
                 )
             if not context_seconds:
                 assign_speaker(segment, speakers.segments, speakers.available)
-        warnings = list(WARNINGS)
+        warnings = [WARNINGS[0]] if self.settings.rag_enabled else list(WARNINGS)
         if not speakers.available:
             warnings.append("화자 분류 결과를 사용할 수 없어 화자는 unknown으로 표시합니다.")
-        if not signals.available:
-            warnings.append("음성 상태 모델 미연결: 호흡·울음·말속도 값은 null입니다.")
         return AnalysisResponse(
             status="pending" if transcript.text else "no_speech",
             transcript=transcript,
             speakers=speakers,
-            audio_signals=signals,
-            analysis_provider=self.analyzer.name,
+            analysis_provider="manual-rag" if self.settings.rag_enabled else self.analyzer.name,
             warnings=warnings,
         )
 
@@ -186,16 +196,64 @@ class AnalysisService:
             if symptoms is not None:
                 result.symptoms = symptoms
                 result.symptom_provider = self.classifier.name
+        if self.settings.rag_enabled:
+            await self.prepare_rag(result, semantic=False)
+        return result
+
+    @staticmethod
+    def conversation(result):
+        segments = result.transcript.segments
+        if segments:
+            return [Turn(id=str(i), speaker=s.speaker, text=s.text) for i, s in enumerate(segments)]
+        return [Turn(id="0", text=result.transcript.text)] if result.transcript.text else []
+
+    async def prepare_rag(self, result, *, semantic=True):
+        turns = self.conversation(result)
+        if not turns:
+            return result
+        result.rag = await run_in_threadpool(
+            self.rag.recommend, turns, result.symptoms, semantic=semantic
+        )
+        result.manual_grounded = bool(result.rag.questions)
+        result.local_questions = [
+            Question(question=q.question, purpose=q.reason) for q in result.rag.questions
+        ]
         return result
 
     async def complete(self, result: AnalysisResponse) -> AnalysisResponse:
+        if self.settings.rag_enabled:
+            result = result.model_copy(deep=True)
+            if result.rag is None:
+                await self.prepare_rag(result)
+            if result.rag is not None:
+                result.rag = await self.rag.refine(
+                    self.conversation(result), result.rag, result.symptoms
+                )
+                result.manual_grounded = bool(result.rag.questions)
+                result.local_questions = [
+                    Question(question=q.question, purpose=q.reason) for q in result.rag.questions
+                ]
+                result.analysis = Situation(
+                    summary=result.rag.summary or "LLM 요약을 아직 생성하지 못했습니다.",
+                    symptoms=result.symptoms,
+                    urgency={
+                        "level": result.rag.urgency.level,
+                        "reason": result.rag.urgency.reason,
+                    },
+                    recommended_questions=result.local_questions,
+                )
+            result.status = (
+                "completed"
+                if result.rag and result.rag.llm_status == "completed"
+                else "unavailable"
+            )
+            result.analysis_provider = "manual-rag"
+            return result
         use_local_symptoms = result.symptom_provider is not None or isinstance(
             self.classifier, KoElectraClassifier
         )
         symptoms = result.symptoms if use_local_symptoms else None
-        situation = await self.analyzer.analyze(
-            result.transcript.text, symptoms, result.audio_signals
-        )
+        situation = await self.analyzer.analyze(result.transcript.text, symptoms)
         if symptoms is not None:
             situation.symptoms = symptoms
         result = result.model_copy(deep=True)
@@ -217,3 +275,4 @@ class AnalysisService:
         close = getattr(self.analyzer, "close", None)
         if close:
             await close()
+        await self.rag.close()

@@ -212,4 +212,7 @@ models/*.pth
 models/*.safetensors
 models/tokenizer/
 models/whisper-base/
+models/whisper-turbo/
 models/labels.json
+models/rag_embedding/
+data/rag/

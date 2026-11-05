@@ -72,6 +72,7 @@ class WhisperTranscriber:
         *,
         word_cutoff: float | None = None,
         context_samples: int = 0,
+        realtime: bool = False,
     ) -> Transcript:
         import numpy as np
 
@@ -82,7 +83,7 @@ class WhisperTranscriber:
             model = self._load()
             try:
                 result, info = self._decode(
-                    model, waveform, language, audio.duration_seconds, word_cutoff
+                    model, waveform, language, audio.duration_seconds, word_cutoff, realtime
                 )
                 context_seconds = context_samples / audio.sample_rate
                 if (
@@ -95,7 +96,12 @@ class WhisperTranscriber:
                     current = waveform[context_samples:]
                     if current.size and float(np.max(np.abs(current))) >= 1e-5:
                         fresh, fresh_info = self._decode(
-                            model, current, language, audio.duration_seconds - context_seconds, 0.0
+                            model,
+                            current,
+                            language,
+                            audio.duration_seconds - context_seconds,
+                            None,
+                            realtime,
                         )
                         if fresh:
                             info = fresh_info
@@ -121,12 +127,34 @@ class WhisperTranscriber:
             provider=f"{self.name}:{Path(self.model_name).name}",
         )
 
-    def _decode(self, model, waveform, language, duration, cutoff):
+    def _decode(self, model, waveform, language, duration, cutoff, realtime=False):
         segments, info = model.transcribe(
             waveform,
             language=None if language == "auto" else language,
             vad_filter=True,
-            beam_size=1,
+            beam_size=(
+                self.settings.whisper_realtime_beam_size
+                if realtime
+                else self.settings.whisper_beam_size
+            ),
+            best_of=1 if realtime else 5,
+            temperature=0.0 if realtime else (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            # Do not seed symptom words: Whisper can copy them into noisy/short
+            # windows even when they were never spoken.
+            hotwords=None,
+            initial_prompt=None,
+            prefix=None,
+            # File decoding keeps Whisper's confidence fallback and longer
+            # silence/padding defaults. Short streaming windows use one pass.
+            vad_parameters=(
+                {
+                    "min_silence_duration_ms": 400,
+                    "min_speech_duration_ms": 100,
+                    "speech_pad_ms": 200,
+                }
+                if realtime
+                else None
+            ),
             condition_on_previous_text=False,
             word_timestamps=cutoff is not None,
         )

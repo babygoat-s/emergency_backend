@@ -22,6 +22,10 @@ dependencies = [
 stt = ["faster-whisper>=1.1,<2"]
 symptom = ["torch>=2.6,<3", "transformers>=4.48,<5"]
 speaker = ["faster-whisper>=1.1,<2", "torch>=2.6,<3", "transformers>=4.48,<5"]
+rag = [
+  "PyMuPDF>=1.25,<2", "chromadb>=1.0,<2", "sentence-transformers>=3.4,<6",
+  "langchain-core>=1.2,<2", "langchain-google-genai>=4.0,<5",
+]
 dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
 
 [tool.setuptools.packages.find]

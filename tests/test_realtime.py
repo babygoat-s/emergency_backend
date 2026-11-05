@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 from app.errors import ServiceError
 from app.main import create_app
 from app.models.koelectra import KoElectraClassifier
-from app.models.placeholders import SpeakerModel, SpeechModel, SymptomModel, VoiceStateModel
+from app.models.placeholders import SpeakerModel, SpeechModel, SymptomModel
 from app.providers.whisper import WhisperTranscriber
 from app.realtime import RealtimeSession
 from app.schemas import StreamStart
@@ -49,7 +50,7 @@ def test_continuous_audio_and_full_updates(backend):
                 assert full["data"]["transcript"]["duration_seconds"] == (i + 1) * 0.5
                 assert len(full["data"]["transcript"]["segments"]) == i + 1
                 assert full["data"]["transcript"]["segments"][-1]["start"] == i * 0.5
-                assert "speakers" in full["data"] and "audio_signals" in full["data"]
+                assert "speakers" in full["data"] and "audio_signals" not in full["data"]
             ws.send_json({"type": "finish"})
             assert ws.receive_json() == {
                 "type": "finished",
@@ -82,8 +83,28 @@ def test_partial_final_window_is_flushed(backend):
         assert ws.receive_json()["duration_seconds"] == 0.1
 
 
+def test_short_pauses_do_not_fragment_default_streaming_windows(backend):
+    backend.service.settings.realtime_window_seconds = 8
+    checked = []
+    backend.transcriber.ends_with_pause = lambda pcm: checked.append(pcm) or True
+    with backend.client.websocket_connect(PATH) as ws:
+        assert begin(ws)["window_seconds"] == 8
+        for _ in range(16):
+            ws.send_bytes(PCM)
+        assert ws.receive_json()["window"] == {"start": 0, "end": 8}
+        assert ws.receive_json()["stage"] == "analysis"
+        ws.send_bytes(PCM)
+        ws.send_json({"type": "finish"})
+        assert ws.receive_json()["window"] == {"start": 8, "end": 8.5}
+        assert ws.receive_json()["stage"] == "analysis"
+        assert ws.receive_json()["duration_seconds"] == 8.5
+    assert not checked
+    assert [call[0].pcm for call in backend.transcriber.calls] == [PCM * 16, PCM]
+
+
 def test_speech_pause_can_end_a_window_early_without_losing_audio(backend):
     backend.service.settings.realtime_window_seconds = 6
+    backend.service.settings.realtime_pause_split = True
     checked = []
 
     def ends_with_pause(pcm):
@@ -93,28 +114,30 @@ def test_speech_pause_can_end_a_window_early_without_losing_audio(backend):
     backend.transcriber.ends_with_pause = ends_with_pause
     with backend.client.websocket_connect(PATH) as ws:
         assert begin(ws)["window_seconds"] == 6
-        for _ in range(6):
+        for _ in range(3):
             ws.send_bytes(PCM)
-        assert ws.receive_json()["window"] == {"start": 0, "end": 3}
+        assert ws.receive_json()["window"] == {"start": 0, "end": 1.5}
         assert ws.receive_json()["stage"] == "analysis"
         ws.send_bytes(PCM)
         ws.send_json({"type": "finish"})
-        assert ws.receive_json()["window"] == {"start": 3, "end": 3.5}
+        assert ws.receive_json()["window"] == {"start": 1.5, "end": 2}
         assert ws.receive_json()["stage"] == "analysis"
-        assert ws.receive_json()["duration_seconds"] == 3.5
-    assert checked == [PCM * 6]
-    assert [call[0].pcm for call in backend.transcriber.calls] == [PCM * 6, PCM]
+        assert ws.receive_json()["duration_seconds"] == 2
+    assert checked == [PCM * 3]
+    assert [call[0].pcm for call in backend.transcriber.calls] == [PCM * 3, PCM]
 
 
+@pytest.mark.parametrize("split", ["fixed", "pause"])
 @pytest.mark.parametrize("previous_word, repeat", [(False, False), (True, False), (True, True)])
-def test_whisper_context_preserves_boundary_speech(settings, previous_word, repeat):
-    settings.realtime_window_seconds = 2
+def test_whisper_context_preserves_boundary_speech(settings, previous_word, repeat, split):
+    settings.realtime_window_seconds = 2 if split == "fixed" else 4
+    settings.realtime_pause_split = split == "pause"
     transcriber = WhisperTranscriber(settings)
-    transcriber.ends_with_pause = lambda pcm: False
+    transcriber.ends_with_pause = lambda pcm: split == "pause" and len(pcm) == 64000
     seen = []
 
     def decode(waveform, *, word_timestamps, **kwargs):
-        assert word_timestamps
+        assert word_timestamps == (len(seen) == 1)
         seen.append(len(waveform))
         first = SimpleNamespace(start=1.5, end=1.95, word=" 숨을")
         second = SimpleNamespace(start=1.95, end=2.4, word=" 쉬기 어려워요")
@@ -163,6 +186,38 @@ def test_whisper_context_preserves_boundary_speech(settings, previous_word, repe
     assert seen == ([32000, 40000, 8000] if repeat else [32000, 40000])
 
 
+def test_whisper_keeps_six_seconds_of_context_without_growing_forever(settings):
+    settings.realtime_window_seconds = 8
+    transcriber = WhisperTranscriber(settings)
+    seen = []
+
+    def decode(waveform, **kwargs):
+        duration = len(waveform) / 16000
+        seen.append(duration)
+        word = SimpleNamespace(start=duration - 0.5, end=duration - 0.1, word=" 네")
+        return iter(
+            [SimpleNamespace(start=word.start, end=word.end, text=word.word, words=[word])]
+        ), SimpleNamespace(language="ko", duration_after_vad=duration)
+
+    transcriber._model = SimpleNamespace(transcribe=decode)
+    service = AnalysisService(settings, transcriber=transcriber, analyzer=FakeAnalyzer())
+    with TestClient(create_app(settings, service)) as client, client.websocket_connect(PATH) as ws:
+        begin(ws)
+        for _ in range(2):
+            for _ in range(16):
+                ws.send_bytes(PCM)
+            assert ws.receive_json()["stage"] == "audio"
+            assert ws.receive_json()["stage"] == "analysis"
+        ws.send_bytes(PCM * 2)
+        ws.send_json({"type": "finish"})
+        event = ws.receive_json()
+        assert event["data"]["transcript"]["text"] == "네 네 네"
+        assert event["data"]["transcript"]["segments"][-1]["start"] == 16.5
+        assert ws.receive_json()["stage"] == "analysis"
+        assert ws.receive_json()["duration_seconds"] == 17
+    assert seen == [8, 14, 7]
+
+
 def test_silence_does_not_stop_stream_or_invent_text(backend):
     with backend.client.websocket_connect(PATH) as ws:
         begin(ws)
@@ -179,16 +234,28 @@ def test_silence_does_not_stop_stream_or_invent_text(backend):
     assert len(backend.analyzer.calls) == 1
 
 
-def test_slow_gemini_does_not_block_audio_and_pending_work_is_coalesced(backend):
+def test_slow_gemini_does_not_block_audio_and_pending_work_is_coalesced(backend, monkeypatch):
     release = threading.Event()
     started = threading.Event()
+    latest_queued = threading.Event()
+    queues = set()
+    enqueue = RealtimeSession.enqueue_latest
     original = backend.analyzer.analyze
 
-    async def slow(text, symptoms, signals):
+    def track_latest(queue, item):
+        enqueue(queue, item)
+        if item[0] == 3:
+            queues.add(id(queue))
+            if len(queues) == 2:
+                latest_queued.set()
+
+    monkeypatch.setattr(RealtimeSession, "enqueue_latest", staticmethod(track_latest))
+
+    async def slow(text, symptoms):
         started.set()
         while not release.is_set():
             await asyncio.sleep(0.005)
-        return await original(text, symptoms, signals)
+        return await original(text, symptoms)
 
     backend.analyzer.analyze = slow
     with backend.client.websocket_connect(PATH) as ws:
@@ -200,6 +267,9 @@ def test_slow_gemini_does_not_block_audio_and_pending_work_is_coalesced(backend)
             ws.send_bytes(PCM)
             event = ws.receive_json()
             assert event["stage"] == "audio" and event["sequence"] == sequence
+        # Audio is sent before classification. Coalescing is only guaranteed
+        # after snapshot 3 reaches the LLM queue, not merely the audio event.
+        assert latest_queued.wait(2)
         ws.send_json({"type": "finish"})
         release.set()
         events = []
@@ -262,11 +332,11 @@ def test_retries_overload_without_waiting_for_more_speech(backend):
     normal = backend.analyzer.analyze
     attempts = []
 
-    async def intermittent(text, symptoms, signals):
+    async def intermittent(text, symptoms):
         attempts.append(text)
         if len(attempts) == 1:
             raise ServiceError(503, "GEMINI_OVERLOADED", "busy", retry_after_seconds=0.02)
-        return await normal(text, symptoms, signals)
+        return await normal(text, symptoms)
 
     backend.analyzer.analyze = intermittent
     with backend.client.websocket_connect(PATH) as ws:
@@ -396,13 +466,59 @@ def test_duration_limit(backend):
 def test_audio_backlog_is_bounded_and_never_silently_dropped(backend):
     async def check():
         session = RealtimeSession(None, backend.service, StreamStart(type="start"))
-        for _ in range(backend.service.settings.realtime_queue_windows):
-            session.enqueue_audio(PCM, 0)
-        with pytest.raises(ServiceError) as error:
-            session.enqueue_audio(PCM, 0)
-        assert error.value.code == "STREAM_BACKPRESSURE"
+        count = backend.service.settings.realtime_queue_windows + 5
+        for i in range(count):
+            session.enqueue_audio(PCM, i * 0.5)
+        assert session.audio_queue.qsize() == count
+        for i in range(count):
+            audio = session.audio_queue.get_nowait()
+            assert audio.pcm == PCM
+            assert audio.start_seconds == i * 0.5
 
     asyncio.run(check())
+
+
+def test_short_cpu_stall_keeps_every_frame_and_does_not_close_socket(backend):
+    original = backend.transcriber.transcribe
+
+    def slow(audio, language):
+        time.sleep(0.03)
+        return original(audio, language)
+
+    backend.transcriber.transcribe = slow
+    with backend.client.websocket_connect(PATH) as ws:
+        begin(ws)
+        for _ in range(12):
+            ws.send_bytes(PCM)
+        ws.send_json({"type": "finish"})
+        audio_events = []
+        while True:
+            event = ws.receive_json()
+            assert event["type"] != "error"
+            if event["type"] == "finished":
+                assert event["windows_processed"] == 12
+                break
+            if event["stage"] == "audio":
+                audio_events.append(event)
+        assert len(audio_events) == 12
+        assert audio_events[-1]["data"]["transcript"]["text"].count("쓰러지셨어요") == 12
+
+
+def test_unexpected_optional_analysis_error_does_not_close_voice_connection(backend):
+    async def fail(*args):
+        raise RuntimeError("private upstream diagnostic")
+
+    backend.service.complete = fail
+    with backend.client.websocket_connect(PATH) as ws:
+        begin(ws)
+        for _ in range(2):
+            ws.send_bytes(PCM)
+            assert ws.receive_json()["stage"] == "audio"
+            result = ws.receive_json()
+            assert result["error"]["code"] == "REALTIME_ANALYSIS_FAILED"
+            assert "private" not in str(result)
+        ws.send_json({"type": "finish"})
+        assert ws.receive_json()["type"] == "finished"
 
 
 def test_speaker_state_is_isolated_and_offsets_are_cumulative(settings):
@@ -486,7 +602,6 @@ def test_foreign_origin_rejected(backend):
 
 def test_empty_model_slots_have_only_provisional_contracts(settings):
     assert SpeakerModel(settings).diarize(None, {}) is None
-    assert VoiceStateModel(settings).analyze(None).available is False
     assert SymptomModel(settings).predict("text") is None
     with pytest.raises(ServiceError) as error:
         SpeechModel(settings).transcribe(None, "ko")

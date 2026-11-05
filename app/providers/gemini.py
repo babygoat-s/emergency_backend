@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.errors import ServiceError
-from app.schemas import SYMPTOM_LABELS, AudioSignals, Situation, Symptom
+from app.schemas import SYMPTOM_LABELS, Situation, Symptom
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ SAFE_API_STATUSES = frozenset(
 )
 
 
-def gemini_response_schema() -> dict:
+def gemini_response_schema(schema: dict | None = None) -> dict:
     """Send structural constraints only; validate all business limits locally.
 
     Large length/number/array bounds increase Gemini's decoding-state space.
@@ -56,7 +56,7 @@ def gemini_response_schema() -> dict:
             if key in supported
         }
 
-    return simplify(Situation.model_json_schema())
+    return simplify(Situation.model_json_schema() if schema is None else schema)
 
 
 def gemini_error_reason(exc: errors.APIError) -> str:
@@ -187,7 +187,7 @@ SYSTEM_PROMPT = """
 symptoms.code는 제공한 범주만 사용한다. evidence는 통화 원문에 실제 존재하는 짧은 인용이다.
 LLM이 추출한 증상의 score는 null이다. 숫자 확신도를 만들어내지 마라.
 local_symptoms가 null이 아니면 로컬 분류 결과와 통화를 함께 참고하고 symptoms는 빈 배열로 반환하라.
-audio_signals.available이 false이면 울음·호흡·감정·말속도 같은 음성 특징을 추측하지 마라.
+입력은 전사 텍스트다. 음향 특징이나 전사에 없는 환자 상태를 추측하지 마라.
 urgency.level은 통화에서 확인된 상태에 근거해 다음 5단계 판단 보조용 범주에서 선택한다.
 minimal(최하)은 경미한 증상과 안정적인 상태가 확인된 경우다.
 low(하)는 상태가 안정적이지만 증상의 지속이나 변화 여부를 확인해야 하는 경우다.
@@ -218,9 +218,7 @@ class GeminiAnalyzer:
     def _seconds_until_retry(self) -> float:
         return max(self._retry_at - monotonic(), 1.0 if self._probe_in_flight else 0.0)
 
-    async def analyze(
-        self, text: str, symptoms: list[Symptom] | None, signals: AudioSignals
-    ) -> Situation:
+    async def analyze(self, text: str, symptoms: list[Symptom] | None) -> Situation:
         if not self.settings.gemini_api_key.get_secret_value().strip():
             raise ServiceError(503, "GEMINI_NOT_CONFIGURED", ".env에 GEMINI_API_KEY를 입력하세요.")
         recovering = self._retry_delay > 0
@@ -244,7 +242,6 @@ class GeminiAnalyzer:
                 "transcript": text,
                 "symptom_categories": SYMPTOM_LABELS if symptoms is None else None,
                 "local_symptoms": None if symptoms is None else [s.model_dump() for s in symptoms],
-                "audio_signals": signals.model_dump(),
             },
             ensure_ascii=False,
         )
@@ -267,6 +264,8 @@ class GeminiAnalyzer:
             if recovering:
                 self._retry_delay = 0
             result = Situation.model_validate_json(response.text or "")
+            if not result.recommended_questions:
+                raise ValueError("Legacy analysis requires at least one question")
         except TIMEOUT_ERRORS as exc:
             raise ServiceError(504, "GEMINI_TIMEOUT", "Gemini 응답 시간이 초과되었습니다.") from exc
         except errors.APIError as exc:

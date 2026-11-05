@@ -38,6 +38,7 @@ class Wav2Vec2Diarizer:
         from torch import nn
         from transformers import Wav2Vec2Config, Wav2Vec2FeatureExtractor, Wav2Vec2Model
 
+        torch.set_num_threads(self.settings.torch_cpu_threads)
         config = Wav2Vec2Config(
             hidden_size=768,
             num_hidden_layers=12,

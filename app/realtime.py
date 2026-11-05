@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from contextlib import suppress
 
 from fastapi import WebSocket
@@ -11,9 +12,10 @@ from app.providers.whisper import WhisperTranscriber
 from app.schemas import AnalysisResponse, Question, StreamStart
 from app.services import AnalysisService, assign_speaker
 
-MIN_PAUSE_CHECK_BYTES = 3 * BYTES_PER_SECOND
-PAUSE_CHECK_INTERVAL_BYTES = BYTES_PER_SECOND // 2
-STT_CONTEXT_BYTES = 2 * BYTES_PER_SECOND
+MIN_PAUSE_CHECK_BYTES = int(1.5 * BYTES_PER_SECOND)
+PAUSE_CHECK_INTERVAL_BYTES = BYTES_PER_SECOND // 4
+STT_CONTEXT_BYTES = 6 * BYTES_PER_SECOND
+logger = logging.getLogger(__name__)
 
 
 def local_questions() -> list[Question]:
@@ -33,7 +35,10 @@ class RealtimeSession:
         self.ws, self.service, self.start = websocket, service, start
         self.settings = service.settings
         self.window_bytes = int(self.settings.realtime_window_seconds * BYTES_PER_SECOND) // 2 * 2
-        self.audio_queue = asyncio.Queue(maxsize=self.settings.realtime_queue_windows)
+        # Total PCM is already capped by max_audio_seconds in receive_audio.
+        # Keep that bounded recording in memory instead of closing the socket
+        # when a brief CPU stall fills a four-window queue.
+        self.audio_queue = asyncio.Queue()
         self.symptom_queue = asyncio.Queue(maxsize=1)
         self.analysis_queue = asyncio.Queue(maxsize=1)
         self.send_lock = asyncio.Lock()
@@ -82,22 +87,18 @@ class RealtimeSession:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def enqueue_audio(self, pcm: bytes, offset: float):
-        try:
-            self.audio_queue.put_nowait(AudioInput(pcm=pcm, start_seconds=offset))
-        except asyncio.QueueFull as exc:
-            # Audio is never silently dropped. The client must report/retry this session.
-            raise ServiceError(
-                503,
-                "STREAM_BACKPRESSURE",
-                "음성 처리 속도가 입력보다 느립니다. 모델·장치를 확인하세요.",
-            ) from exc
+        self.audio_queue.put_nowait(AudioInput(pcm=pcm, start_seconds=offset))
 
     async def receive_audio(self):
         from starlette.websockets import WebSocketDisconnect
 
         buffer = bytearray()
         offset = 0.0
-        detect_pause = getattr(self.service.realtime_transcriber, "ends_with_pause", None)
+        detect_pause = (
+            getattr(self.service.realtime_transcriber, "ends_with_pause", None)
+            if self.settings.realtime_pause_split
+            else None
+        )
         next_pause_check = MIN_PAUSE_CHECK_BYTES
         while True:
             message = await asyncio.wait_for(
@@ -194,6 +195,7 @@ class RealtimeSession:
             "sequence": sequence,
             "window": window,
             "data": result.model_dump(mode="json"),
+            "processing_lag_seconds": max(0.0, self.total_bytes / BYTES_PER_SECOND - window["end"]),
         }
         if error:
             event["error"] = error
@@ -220,13 +222,17 @@ class RealtimeSession:
             result = self.accumulate(result, audio, len(context) / BYTES_PER_SECOND)
             if result.transcript.segments:
                 committed_end = result.transcript.segments[-1].end
-            # Pause-aligned windows can start fresh. Preserve audio at fixed-length cuts.
-            if use_context and len(audio.pcm) == self.window_bytes:
+            # A short pause need not end the sentence. Keep acoustic context at
+            # every boundary, including optional pause-aligned cuts.
+            if use_context:
                 context = (context + audio.pcm)[-STT_CONTEXT_BYTES:]
             else:
                 context = b""
             if has_speech:
-                result.local_questions = local_questions()
+                if self.settings.rag_enabled:
+                    await self.service.prepare_rag(result, semantic=False)
+                else:
+                    result.local_questions = local_questions()
             self.windows_processed += 1
             sequence = self.windows_processed
             window = {
@@ -258,18 +264,25 @@ class RealtimeSession:
         request_at = retry_at = 0.0
         item = await self.analysis_queue.get()
         retrying = False
+        input_ended = False
         while item is not None:
-            finishing = False
+            finishing = input_ended
             while (delay := max(request_at, retry_at) - loop.time()) > 0:
+                if input_ended:
+                    await asyncio.sleep(delay)
+                    break
                 try:
                     latest = await asyncio.wait_for(self.analysis_queue.get(), timeout=delay)
                 except asyncio.TimeoutError:
                     break
                 if latest is None:
                     # Flush the latest result on stop, unless Gemini is still cooling down.
-                    if retry_at > loop.time():
+                    if retry_at > loop.time() and not self.settings.rag_enabled:
                         return
+                    if retry_at > loop.time():
+                        await asyncio.sleep(max(0, retry_at - loop.time()))
                     finishing = True
+                    input_ended = True
                     break
                 item = latest
                 retrying = False
@@ -294,8 +307,20 @@ class RealtimeSession:
                 error = exc.body()["error"]
                 if exc.retry_after_seconds and exc.retry_after_seconds > 0:
                     retry_at = loop.time() + exc.retry_after_seconds
+            except Exception as exc:
+                logger.warning("Optional realtime analysis failed (type=%s)", type(exc).__name__)
+                result = snapshot.model_copy(update={"status": "unavailable"})
+                error = {
+                    "code": "REALTIME_ANALYSIS_FAILED",
+                    "message": "보조 분석을 완료하지 못했습니다. 음성 전사는 계속 처리합니다.",
+                }
+            if result.rag and result.rag.retry_after_seconds > 0 and not retrying:
+                retry_at = loop.time() + min(result.rag.retry_after_seconds, 10)
             await self.send_update("analysis", sequence, window, result, error)
             if finishing:
+                if result.rag and retry_at and not retrying:
+                    retrying = True
+                    continue
                 return
             if not retry_at or retrying:
                 item = await self.analysis_queue.get()

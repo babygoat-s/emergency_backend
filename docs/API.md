@@ -23,7 +23,7 @@
 
 ### Response body
 
-성공(200): `AnalysisResponse`. 파일 전체를 한 번에 분석해 반환합니다.
+성공(200)은 파일 전체를 분석한 `AnalysisResponse`를 반환합니다. 아래는 로컬 증상 분류기와 화자 모델이 설정되지 않아 Gemini가 증상 추출도 담당하는 구성의 예시입니다.
 
 ```json
 {
@@ -102,6 +102,7 @@
       "score": null
     }
   ],
+  "local_questions": [],
   "symptom_provider": "gemini:gemini-3.5-flash-lite",
   "analysis_provider": "gemini:gemini-3.5-flash-lite",
   "manual_grounded": false,
@@ -109,7 +110,7 @@
   "warnings": [
     "AI 결과는 신고접수 담당자의 판단 보조 정보이며 확정 진단이나 출동 결정이 아닙니다.",
     "공식 응급 매뉴얼 검색 자료가 연결되지 않아 질문은 매뉴얼 근거가 검증되지 않았습니다.",
-    "화자 분류 모델 미연결: 화자는 unknown입니다.",
+    "화자 분류 결과를 사용할 수 없어 화자는 unknown으로 표시합니다.",
     "음성 상태 모델 미연결: 호흡·울음·말속도 값은 null입니다."
   ]
 }
@@ -122,13 +123,14 @@
 | `transcript` | 전사 텍스트·언어·길이·시간 구간·화자·제공자 |
 | `transcript.segments[].speaker` | `caller`, `operator`, `unknown` |
 | `analysis` | 상황 요약·증상·긴급도·확인 질문 객체; 실시간 처리 중 또는 실패 시 `null` |
-| `analysis.urgency.level` | `critical`, `high`, `moderate`, `low`, `unknown` |
+| `analysis.urgency.level` | `minimal`(최하), `low`(하), `moderate`(중), `high`(상), `critical`(최상). 판단에 필요한 정보가 부족하면 `unknown`(판단 보류) |
 | `analysis.recommended_questions` | `{question: string, purpose: string}` 배열, 1~5개 |
 | `symptoms` | `{code, label, evidence, score}` 배열, 최대 10개; 완료 시 `analysis.symptoms`와 동일 |
-| `symptoms[].code` | `collapse`, `breathing_difficulty`, `suspected_no_breathing`, `altered_consciousness`, `chest_pain`, `bleeding`, `seizure`, `burn`, `trauma`, `other` |
+| `symptoms[].code` | KoELECTRA는 `fever`, `nausea_vomiting`, `headache`, `abdominal_pain`, `dizziness`, `laceration`, `general_weakness`, `breathing_difficulty` 반환. 기존 코드 `collapse`, `suspected_no_breathing`, `altered_consciousness`, `chest_pain`, `bleeding`, `seizure`, `burn`, `trauma`, `other`도 허용 |
 | `symptoms[].evidence` | string 또는 `null` |
 | `symptoms[].score` | 0~1 또는 `null`; Gemini 추출은 `null` |
-| `speakers.segments` | `{start: number, end: number, speaker_id: string, role: caller/operator/unknown}` 배열 |
+| `local_questions` | 실시간 새 발화의 기본 확인 질문 `{question, purpose}` 배열. 파일 분석에서는 기본 빈 배열 |
+| `speakers.segments` | `{start: number, end: number, speaker_id: string, role: caller/operator/unknown}` 배열. Wav2Vec2의 `speaker_0`, `speaker_1`은 분류 클래스 ID |
 | `audio_signals` | 모델 미연결 시 `available=false`, 나머지 값은 `null` |
 | `symptom_provider` | string 또는 `null` |
 | `analysis_provider` | string; 설정된 분석 모델에 따라 달라짐 |
@@ -185,15 +187,18 @@ JSON text 메시지:
 
 | 메시지 | 필드 |
 | --- | --- |
-| 준비 | `type="ready"`, `encoding="pcm_s16le"`, `sample_rate=16000`, `channels=1`, `window_seconds=number`, `max_frame_bytes=32000` |
+| 준비 | `type="ready"`, `encoding="pcm_s16le"`, `sample_rate=16000`, `channels=1`, `window_seconds=number` (전사 구간의 최대 길이), `max_frame_bytes=32000` |
 | 음성 처리 결과 | `type="update"`, `stage="audio"`, `sequence=integer`, `window={start:number,end:number}`, `data=AnalysisResponse` |
+| 로컬 증상 결과 | `type="update"`, `stage="symptoms"`, 같은 `sequence`와 `window`, `data.symptom_provider`가 분류기를 식별하며 `data.symptoms`가 비어 있을 수 있음. 분류 실패 시 `error` 필드를 포함하며 상황 분석은 계속됨 |
 | 상황 분석 결과 | `type="update"`, `stage="analysis"`, `sequence=integer`, `window={start:number,end:number}`, `data=AnalysisResponse`; 실패 시 `error={code:string,message:string}` 추가 |
 | 정상 종료 | `type="finished"`, `windows_processed=integer`, `duration_seconds=number` |
 | 오류 종료 | `type="error"`, `error={code:string,message:string}` |
 
 `data`는 파일 분석의 `AnalysisResponse`와 같은 구조입니다. `sequence`는 입력 구간 번호이며 같은 구간의 `audio`와 `analysis`는 같은 번호입니다. 서로 다른 구간의 응답은 순서가 바뀔 수 있습니다. `window.start/end`와 모든 발화 시간은 세션 시작 기준 초입니다.
 
-`audio` 단계는 `analysis=null`, 발화가 있으면 `status=pending`, 없으면 `status=no_speech`입니다. 전사와 화자 구간은 누적되고 음성 상태는 최근 `window` 구간의 값입니다. `analysis` 단계는 완료 시 `status=completed`, 실패 시 `status=unavailable`, `analysis=null`입니다. 상황 분석 실패 시 연결은 유지됩니다.
+`audio` 단계는 `analysis=null`, 새 발화가 있으면 `status=pending`과 `local_questions`를 보내며, 없으면 `status=no_speech`입니다. 전사와 화자 구간은 누적되고 음성 상태는 최근 `window` 구간의 값입니다. 경계에서 복구한 전사 타임스탬프는 직전 `window`에 걸칠 수 있습니다. `analysis` 단계는 완료 시 `status=completed`, 실패 시 `status=unavailable`, `analysis=null`입니다. 상황 분석 실패 시 연결과 기본 확인 질문은 유지됩니다.
+
+녹음 중 상황 분석은 `realtime_analysis_min_interval_seconds` 이상의 간격으로 최신 누적 전사를 사용합니다. Gemini 503 이후에는 대기 시간이 지난 뒤 최신 전사를 한 번 재시도하므로 같은 `sequence`의 `analysis` 이벤트가 오류와 성공으로 각각 도착할 수 있습니다. 종료 시 503 대기가 남아 있으면 기본 질문을 남기고 `finished`를 반환합니다.
 
 준비 응답 예시:
 
@@ -203,7 +208,7 @@ JSON text 메시지:
   "encoding": "pcm_s16le",
   "sample_rate": 16000,
   "channels": 1,
-  "window_seconds": 3.0,
+  "window_seconds": 6.0,
   "max_frame_bytes": 32000
 }
 ```
@@ -239,13 +244,19 @@ JSON text 메시지:
   "transcriber": "faster-whisper",
   "diarizer": "speaker-not-connected",
   "symptom_classifier": "symptom-not-connected",
+  "koelectra_symptom_labels": ["고열", "구토·오심", "두통", "복통", "어지러움", "열상", "전신쇠약", "호흡곤란"],
+  "example_preview": {
+    "quote": "열이 39도이고 토하고 머리가 아파요.",
+    "symptom_labels": ["고열", "구토·오심", "두통"]
+  },
   "situation_analyzer": "gemini:gemini-3.5-flash-lite",
   "audio_analyzer": "voice-state-not-connected",
   "history_enabled": false,
   "manual_grounded": false,
   "streaming_mode": "pcm_s16le",
-  "realtime_window_seconds": 3.0,
-  "realtime_analysis_timeout_seconds": 3.0,
+  "realtime_window_seconds": 6.0,
+  "realtime_analysis_timeout_seconds": 15.0,
+  "realtime_analysis_min_interval_seconds": 10.0,
   "realtime_sample_rate": 16000,
   "realtime_channels": 1
 }
@@ -265,13 +276,13 @@ JSON text 메시지:
 | --- | --- |
 | `status` | `completed` |
 | `is_demo` | `true` |
-| `transcript.text` | `여보세요. 아버지가 갑자기 쓰러지셨어요. 숨을 안 쉬는 것 같아요. 빨리 와주세요.` |
-| `transcript.duration_seconds` | `8.0` |
+| `transcript.text` | `119입니다. 어떤 증상이 있나요? 열이 39도이고 토하고 머리가 아파요.` |
+| `transcript.duration_seconds` | `7.0` |
 | `transcript.provider` | `example` |
 | `symptom_provider` | `example` |
 | `analysis_provider` | `example` |
-| `analysis.symptoms`, `symptoms` | 쓰러짐·호흡 없음 의심 예시, 각각 `score=null` |
-| `analysis.urgency.level` | `critical` |
+| `analysis.symptoms`, `symptoms` | 고열·구토·오심·두통 예시, 각각 `score=null` |
+| `analysis.urgency.level` | `unknown` |
 | `warnings` | 고정 예시 안내 및 담당자 검토·매뉴얼 미연결 안내 |
 
 ## 서버 상태 확인 — GET /api/v1/health

@@ -35,6 +35,16 @@ def test_health_config_and_example_without_key(settings):
         example = client.get("/api/v1/analysis/example").json()
         assert example["is_demo"] is True
         assert example["symptoms"] == example["analysis"]["symptoms"]
+        labels = [symptom["label"] for symptom in example["symptoms"]]
+        assert len(config["koelectra_symptom_labels"]) == 8
+        assert set(labels) <= set(config["koelectra_symptom_labels"])
+        assert config["example_preview"] == {
+            "quote": example["transcript"]["segments"][1]["text"],
+            "symptom_labels": labels,
+        }
+        assert all(
+            symptom["evidence"] in example["transcript"]["text"] for symptom in example["symptoms"]
+        )
 
 
 def test_paths_are_grouped_and_old_endpoints_are_removed(backend):

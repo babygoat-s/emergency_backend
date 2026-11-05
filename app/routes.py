@@ -8,6 +8,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.errors import ServiceError
 from app.examples import example_analysis
+from app.models.koelectra import LABEL_CODES
 from app.realtime import RealtimeSession
 from app.schemas import AnalysisResponse, ConfigResponse, ErrorResponse, HealthResponse, StreamStart
 from app.services import AnalysisService
@@ -37,6 +38,7 @@ async def health(service: Service):
 @router.get("/analysis/config", response_model=ConfigResponse, summary="분석 설정")
 async def config(service: Service):
     settings = service.settings
+    demo = example_analysis()
     return {
         "supported_audio_formats": list(SUPPORTED_EXTENSIONS),
         "max_upload_mb": settings.max_upload_mb,
@@ -45,10 +47,19 @@ async def config(service: Service):
         "transcriber": service.transcriber.name,
         "diarizer": service.diarizer.name,
         "symptom_classifier": service.classifier.name,
+        "koelectra_symptom_labels": list(LABEL_CODES),
+        "example_preview": {
+            "quote": next(
+                (s.text for s in demo.transcript.segments if s.speaker == "caller"),
+                demo.transcript.text,
+            ),
+            "symptom_labels": [s.label for s in demo.symptoms],
+        },
         "situation_analyzer": service.analyzer.name,
         "audio_analyzer": service.audio_analyzer.name,
         "realtime_window_seconds": settings.realtime_window_seconds,
         "realtime_analysis_timeout_seconds": settings.realtime_analysis_timeout_seconds,
+        "realtime_analysis_min_interval_seconds": settings.realtime_analysis_min_interval_seconds,
     }
 
 

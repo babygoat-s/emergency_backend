@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from time import monotonic
 
 import httpx
 from google import genai
@@ -142,6 +143,10 @@ def gemini_api_error(exc: errors.APIError) -> ServiceError:
         return ServiceError(
             503, "GEMINI_RATE_LIMITED", f"Gemini 요청 한도를 초과했습니다({detail})."
         )
+    if exc.code == 503:
+        return ServiceError(
+            503, "GEMINI_OVERLOADED", f"Gemini 서버가 일시적으로 혼잡합니다({detail})."
+        )
     if exc.code in (401, 403, 404):
         return ServiceError(
             503,
@@ -155,7 +160,7 @@ def gemini_api_error(exc: errors.APIError) -> ServiceError:
             f"Gemini 서버가 생성 처리 시간 초과를 반환했습니다({detail}). "
             "잠시 후 다시 시도하거나 다른 모델로 연결을 확인하세요.",
         )
-    if exc.code in (500, 502, 503):
+    if exc.code in (500, 502):
         return ServiceError(
             502,
             "GEMINI_FAILED",
@@ -181,10 +186,15 @@ SYSTEM_PROMPT = """
 관찰된 증상만 추출하고 부정·과거력·다른 대상의 증상을 현재 환자 증상으로 단정하지 마라.
 symptoms.code는 제공한 범주만 사용한다. evidence는 통화 원문에 실제 존재하는 짧은 인용이다.
 LLM이 추출한 증상의 score는 null이다. 숫자 확신도를 만들어내지 마라.
-local_symptoms가 null이 아니면 로컬 분류 결과를 참고하되 통화와 함께 판단하라.
+local_symptoms가 null이 아니면 로컬 분류 결과와 통화를 함께 참고하고 symptoms는 빈 배열로 반환하라.
 audio_signals.available이 false이면 울음·호흡·감정·말속도 같은 음성 특징을 추측하지 마라.
-urgency.level은 critical/high/moderate/low/unknown 중 판단 보조용 범주다. KTAS 점수가 아니다.
-정보 부족은 unknown으로 표시하고 요약 및 사유에 불확실성을 설명하라.
+urgency.level은 통화에서 확인된 상태에 근거해 다음 5단계 판단 보조용 범주에서 선택한다.
+minimal(최하)은 경미한 증상과 안정적인 상태가 확인된 경우다.
+low(하)는 상태가 안정적이지만 증상의 지속이나 변화 여부를 확인해야 하는 경우다.
+moderate(중)는 뚜렷한 증상이나 상태 변화로 신속한 확인이 필요한 경우다.
+high(상)는 중대한 이상 징후나 빠른 악화가 의심되는 경우다.
+critical(최상)은 즉각적인 생명 위험이 의심되는 경우다.
+근거가 부족하면 단계 대신 unknown(판단 보류)을 사용하고 요약 및 사유에 불확실성을 설명하라.
 실제 출동 여부나 확정 진단, 치료 지시를 생성하지 마라.
 다음 확인 질문 1~5개를 중복 없이 중요도 순으로 생성한다. 이미 확인된 사항은 다시 묻지 마라.
 현재 공식 응급 매뉴얼이 제공되지 않았다. 매뉴얼을 인용하거나 준수를 주장하지 마라.
@@ -197,12 +207,30 @@ class GeminiAnalyzer:
         self.settings = settings
         self.name = f"gemini:{settings.gemini_model}"
         self._client = None
+        self._retry_delay = 0
+        self._retry_at = 0.0
+        self._probe_in_flight = False
+
+    def _delay_retry(self):
+        self._retry_delay = min(self._retry_delay * 2 or 5, 60)
+        self._retry_at = monotonic() + self._retry_delay
+
+    def _seconds_until_retry(self) -> float:
+        return max(self._retry_at - monotonic(), 1.0 if self._probe_in_flight else 0.0)
 
     async def analyze(
         self, text: str, symptoms: list[Symptom] | None, signals: AudioSignals
     ) -> Situation:
         if not self.settings.gemini_api_key.get_secret_value().strip():
             raise ServiceError(503, "GEMINI_NOT_CONFIGURED", ".env에 GEMINI_API_KEY를 입력하세요.")
+        recovering = self._retry_delay > 0
+        if recovering and (monotonic() < self._retry_at or self._probe_in_flight):
+            raise ServiceError(
+                503,
+                "GEMINI_OVERLOADED",
+                "Gemini 재시도 간격이 지나기를 기다립니다.",
+                retry_after_seconds=self._seconds_until_retry(),
+            )
         if self._client is None:
             self._client = genai.Client(
                 api_key=self.settings.gemini_api_key.get_secret_value(),
@@ -214,12 +242,14 @@ class GeminiAnalyzer:
         payload = json.dumps(
             {
                 "transcript": text,
-                "symptom_categories": SYMPTOM_LABELS,
+                "symptom_categories": SYMPTOM_LABELS if symptoms is None else None,
                 "local_symptoms": None if symptoms is None else [s.model_dump() for s in symptoms],
                 "audio_signals": signals.model_dump(),
             },
             ensure_ascii=False,
         )
+        if recovering:
+            self._probe_in_flight = True
         try:
             response = await asyncio.wait_for(
                 self._client.aio.models.generate_content(
@@ -234,11 +264,20 @@ class GeminiAnalyzer:
                 ),
                 timeout=self.settings.gemini_timeout_seconds,
             )
+            if recovering:
+                self._retry_delay = 0
             result = Situation.model_validate_json(response.text or "")
         except TIMEOUT_ERRORS as exc:
             raise ServiceError(504, "GEMINI_TIMEOUT", "Gemini 응답 시간이 초과되었습니다.") from exc
         except errors.APIError as exc:
-            raise gemini_api_error(exc) from exc
+            error = gemini_api_error(exc)
+            if exc.code == 503:
+                if recovering or self._retry_delay == 0:
+                    self._delay_retry()
+                error.retry_after_seconds = self._seconds_until_retry()
+            elif recovering:
+                self._retry_delay = 0
+            raise error from exc
         except (ValidationError, ValueError) as exc:
             raise ServiceError(
                 502, "INVALID_AI_RESPONSE", "AI 응답 형식이 올바르지 않습니다."
@@ -247,6 +286,11 @@ class GeminiAnalyzer:
             raise ServiceError(
                 502, "GEMINI_CONNECTION_FAILED", "Gemini 연결에 실패했습니다."
             ) from exc
+        finally:
+            if recovering:
+                if self._retry_delay and self._retry_at <= monotonic():
+                    self._delay_retry()
+                self._probe_in_flight = False
 
         # Labels and evidence are constrained by the server, not trusted from the LLM.
         for symptom in result.symptoms:

@@ -14,6 +14,13 @@ SymptomCode = Literal[
     "burn",
     "trauma",
     "other",
+    "fever",
+    "nausea_vomiting",
+    "headache",
+    "abdominal_pain",
+    "dizziness",
+    "laceration",
+    "general_weakness",
 ]
 
 SYMPTOM_LABELS: dict[str, str] = {
@@ -27,6 +34,13 @@ SYMPTOM_LABELS: dict[str, str] = {
     "burn": "화상",
     "trauma": "외상",
     "other": "기타",
+    "fever": "고열",
+    "nausea_vomiting": "구토·오심",
+    "headache": "두통",
+    "abdominal_pain": "복통",
+    "dizziness": "어지러움",
+    "laceration": "열상",
+    "general_weakness": "전신쇠약",
 }
 
 
@@ -65,7 +79,7 @@ class Symptom(StrictModel):
 
 
 class Urgency(StrictModel):
-    level: Literal["critical", "high", "moderate", "low", "unknown"]
+    level: Literal["minimal", "low", "moderate", "high", "critical", "unknown"]
     reason: str = Field(min_length=1, max_length=1500)
 
 
@@ -123,6 +137,7 @@ class AnalysisResponse(StrictModel):
     speakers: SpeakerAnalysis = Field(default_factory=SpeakerAnalysis)
     audio_signals: AudioSignals = Field(default_factory=AudioSignals)
     symptoms: list[Symptom] = Field(default_factory=list)
+    local_questions: list[Question] = Field(default_factory=list)
     symptom_provider: str | None = None
     analysis_provider: str
     manual_grounded: Literal[False] = False
@@ -153,6 +168,11 @@ class HealthResponse(StrictModel):
     storage: Literal["none"] = "none"
 
 
+class ExamplePreview(StrictModel):
+    quote: str
+    symptom_labels: list[str]
+
+
 class ConfigResponse(StrictModel):
     supported_audio_formats: list[str]
     max_upload_mb: int
@@ -161,6 +181,8 @@ class ConfigResponse(StrictModel):
     transcriber: str
     diarizer: str
     symptom_classifier: str
+    koelectra_symptom_labels: list[str]
+    example_preview: ExamplePreview
     situation_analyzer: str
     audio_analyzer: str | None
     history_enabled: Literal[False] = False
@@ -168,5 +190,6 @@ class ConfigResponse(StrictModel):
     streaming_mode: Literal["pcm_s16le"] = "pcm_s16le"
     realtime_window_seconds: float
     realtime_analysis_timeout_seconds: float
+    realtime_analysis_min_interval_seconds: float
     realtime_sample_rate: Literal[16000] = 16000
     realtime_channels: Literal[1] = 1

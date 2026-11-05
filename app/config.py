@@ -3,6 +3,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.schemas import Speaker
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -19,15 +21,22 @@ class Settings(BaseSettings):
     max_concurrent_inferences: int = Field(default=2, ge=1, le=16)
     inference_queue_timeout_seconds: float = Field(default=10, gt=0, le=300)
     whisper_model: str = "small"
+    whisper_realtime_model: str = ""
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
     whisper_local_files_only: bool = False
+    whisper_cpu_threads: int = Field(default=4, ge=1, le=32)
     transcriber_factory: str = ""
     diarizer_factory: str = ""
+    speaker_model_path: str = ""
+    speaker_class_roles: tuple[Speaker, Speaker] = ("unknown", "unknown")
     audio_analyzer_factory: str = ""
     classifier_factory: str = ""
-    realtime_window_seconds: float = Field(default=3, ge=0.5, le=3)
-    realtime_analysis_timeout_seconds: float = Field(default=3, gt=0, le=60)
+    symptom_model_path: str = ""
+    symptom_tokenizer_path: str = ""
+    realtime_window_seconds: float = Field(default=6, ge=0.5, le=10)
+    realtime_analysis_timeout_seconds: float = Field(default=15, gt=0, le=60)
+    realtime_analysis_min_interval_seconds: float = Field(default=10, ge=0, le=60)
     realtime_queue_windows: int = Field(default=4, ge=1, le=20)
     ws_idle_timeout_seconds: float = Field(default=120, gt=0, le=3600)
 

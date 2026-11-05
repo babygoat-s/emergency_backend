@@ -211,4 +211,5 @@ models/*.pt
 models/*.pth
 models/*.safetensors
 models/tokenizer/
+models/whisper-base/
 models/labels.json

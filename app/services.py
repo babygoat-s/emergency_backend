@@ -1,13 +1,16 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from importlib import import_module
 
 from starlette.concurrency import run_in_threadpool
 
-from app.audio import AudioInput, decode_upload
+from app.audio import BYTES_PER_SECOND, AudioInput, decode_upload
 from app.config import Settings
 from app.errors import ServiceError
+from app.models.koelectra import KoElectraClassifier
 from app.models.placeholders import SpeakerModel, SymptomModel, VoiceStateModel
+from app.models.wav2vec2_speakers import Wav2Vec2Diarizer
 from app.providers.base import (
     AudioAnalyzer,
     Diarizer,
@@ -17,7 +20,9 @@ from app.providers.base import (
 )
 from app.providers.gemini import GeminiAnalyzer
 from app.providers.whisper import WhisperTranscriber
-from app.schemas import AnalysisResponse, SpeakerAnalysis, Transcript
+from app.schemas import AnalysisResponse, Segment, SpeakerAnalysis, SpeakerSpan, Transcript
+
+logger = logging.getLogger(__name__)
 
 WARNINGS = [
     "AI 결과는 신고접수 담당자의 판단 보조 정보이며 확정 진단이나 출동 결정이 아닙니다.",
@@ -28,6 +33,14 @@ WARNINGS = [
 def load_provider(spec: str, settings: Settings):
     module, attribute = spec.split(":", 1)
     return getattr(import_module(module), attribute)(settings)
+
+
+def assign_speaker(segment: Segment, spans: list[SpeakerSpan], available: bool):
+    matches = [s for s in spans if s.start < segment.end and s.end > segment.start]
+    if matches and len({s.speaker_id for s in matches}) == 1:
+        segment.speaker_id, segment.speaker = matches[0].speaker_id, matches[0].role
+    elif available:
+        segment.speaker_id, segment.speaker = None, "unknown"
 
 
 class AnalysisService:
@@ -47,20 +60,49 @@ class AnalysisService:
             return instance or (load_provider(factory, settings) if factory else default(settings))
 
         self.transcriber = provider(transcriber, settings.transcriber_factory, WhisperTranscriber)
-        self.diarizer = provider(diarizer, settings.diarizer_factory, SpeakerModel)
-        self.classifier = provider(classifier, settings.classifier_factory, SymptomModel)
+        self.realtime_transcriber = self.transcriber
+        realtime_model = settings.whisper_realtime_model
+        if (
+            transcriber is None
+            and not settings.transcriber_factory
+            and realtime_model
+            and realtime_model != settings.whisper_model
+        ):
+            self.realtime_transcriber = WhisperTranscriber(settings, realtime_model)
+        diarizer_default = Wav2Vec2Diarizer if settings.speaker_model_path else SpeakerModel
+        self.diarizer = provider(diarizer, settings.diarizer_factory, diarizer_default)
+        classifier_default = KoElectraClassifier if settings.symptom_model_path else SymptomModel
+        self.classifier = provider(classifier, settings.classifier_factory, classifier_default)
         self.audio_analyzer = provider(
             audio_analyzer, settings.audio_analyzer_factory, VoiceStateModel
         )
         self.analyzer = analyzer or GeminiAnalyzer(settings)
-        # Gemini waiting never occupies a local inference slot.
-        self._semaphore = asyncio.Semaphore(settings.max_concurrent_inferences)
+        self._audio_slots = asyncio.Semaphore(settings.max_concurrent_inferences)
+        self._classifier_slots = asyncio.Semaphore(1)
+
+    async def warm_models(self):
+        models = []
+        if self.settings.whisper_realtime_model and isinstance(
+            self.realtime_transcriber, WhisperTranscriber
+        ):
+            models.append(self.realtime_transcriber)
+        if isinstance(self.diarizer, Wav2Vec2Diarizer):
+            models.append(self.diarizer)
+        if isinstance(self.classifier, KoElectraClassifier):
+            models.append(self.classifier)
+        for model in models:
+            try:
+                await run_in_threadpool(model.warmup)
+            except ServiceError as exc:
+                logger.warning("Model warmup failed: %s (%s)", model.name, exc.code)
 
     @asynccontextmanager
-    async def slot(self):
+    async def slot(self, semaphore: asyncio.Semaphore | None = None):
+        if semaphore is None:
+            semaphore = self._audio_slots
         try:
             await asyncio.wait_for(
-                self._semaphore.acquire(), timeout=self.settings.inference_queue_timeout_seconds
+                semaphore.acquire(), timeout=self.settings.inference_queue_timeout_seconds
             )
         except asyncio.TimeoutError as exc:
             raise ServiceError(
@@ -69,17 +111,36 @@ class AnalysisService:
         try:
             yield
         finally:
-            self._semaphore.release()
+            semaphore.release()
 
     async def local_analysis(
         self,
         audio: AudioInput,
         language: str,
         speaker_state: dict,
+        *,
+        realtime: bool = False,
+        stt_context: bytes = b"",
+        committed_end: float = 0.0,
     ) -> AnalysisResponse:
+        transcriber = self.realtime_transcriber if realtime else self.transcriber
+        context_seconds = 0.0
         async with self.slot():
+            if realtime and isinstance(transcriber, WhisperTranscriber):
+                context_seconds = len(stt_context) / BYTES_PER_SECOND
+                stt_audio = AudioInput(pcm=stt_context + audio.pcm)
+                cutoff = max(0.0, committed_end - (audio.start_seconds - context_seconds))
+                stt = run_in_threadpool(
+                    transcriber.transcribe,
+                    stt_audio,
+                    language,
+                    word_cutoff=cutoff,
+                    context_samples=len(stt_context) // 2,
+                )
+            else:
+                stt = run_in_threadpool(transcriber.transcribe, audio, language)
             transcript, spans, signals = await asyncio.gather(
-                run_in_threadpool(self.transcriber.transcribe, audio, language),
+                stt,
                 run_in_threadpool(self.diarizer.diarize, audio, speaker_state),
                 run_in_threadpool(self.audio_analyzer.analyze, audio),
             )
@@ -98,20 +159,15 @@ class AnalysisService:
                 )
         transcript.diarization_available = speakers.available
         for segment in transcript.segments:
-            if segment.end > audio.duration_seconds + 0.01:
+            if segment.end > audio.duration_seconds + context_seconds + 0.01:
                 raise ServiceError(
                     502, "INVALID_MODEL_OUTPUT", "전사 구간이 입력 범위를 초과했습니다."
                 )
-            matches = [
-                s for s in speakers.segments if s.start < segment.end and s.end > segment.start
-            ]
-            if matches and len({s.speaker_id for s in matches}) == 1:
-                segment.speaker_id, segment.speaker = matches[0].speaker_id, matches[0].role
-            elif speakers.available:
-                segment.speaker_id, segment.speaker = None, "unknown"
+            if not context_seconds:
+                assign_speaker(segment, speakers.segments, speakers.available)
         warnings = list(WARNINGS)
         if not speakers.available:
-            warnings.append("화자 분류 모델 미연결: 화자는 unknown입니다.")
+            warnings.append("화자 분류 결과를 사용할 수 없어 화자는 unknown으로 표시합니다.")
         if not signals.available:
             warnings.append("음성 상태 모델 미연결: 호흡·울음·말속도 값은 null입니다.")
         return AnalysisResponse(
@@ -125,7 +181,7 @@ class AnalysisService:
 
     async def classify(self, result: AnalysisResponse) -> AnalysisResponse:
         if result.transcript.text:
-            async with self.slot():
+            async with self.slot(self._classifier_slots):
                 symptoms = await run_in_threadpool(self.classifier.predict, result.transcript.text)
             if symptoms is not None:
                 result.symptoms = symptoms
@@ -133,7 +189,10 @@ class AnalysisService:
         return result
 
     async def complete(self, result: AnalysisResponse) -> AnalysisResponse:
-        symptoms = result.symptoms if result.symptom_provider else None
+        use_local_symptoms = result.symptom_provider is not None or isinstance(
+            self.classifier, KoElectraClassifier
+        )
+        symptoms = result.symptoms if use_local_symptoms else None
         situation = await self.analyzer.analyze(
             result.transcript.text, symptoms, result.audio_signals
         )
@@ -143,7 +202,8 @@ class AnalysisService:
         result.status = "completed"
         result.analysis = situation
         result.symptoms = situation.symptoms
-        result.symptom_provider = result.symptom_provider or self.analyzer.name
+        if symptoms is None:
+            result.symptom_provider = self.analyzer.name
         return result
 
     async def analyze_file(self, data: bytes, language: str) -> AnalysisResponse:

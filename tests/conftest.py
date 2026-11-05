@@ -68,7 +68,13 @@ class FakeDiarizer:
 
 @pytest.fixture
 def settings():
-    return Settings(_env_file=None, gemini_api_key="", max_upload_mb=1, realtime_window_seconds=0.5)
+    return Settings(
+        _env_file=None,
+        gemini_api_key="",
+        max_upload_mb=1,
+        realtime_window_seconds=0.5,
+        realtime_analysis_min_interval_seconds=0,
+    )
 
 
 @pytest.fixture

@@ -63,12 +63,16 @@ def test_whisper_receives_normalized_audio_and_reuses_model(monkeypatch):
 
         def transcribe(self, waveform, **kwargs):
             assert waveform.dtype.name == "float32" and len(waveform) == 16000
-            return iter([SimpleNamespace(start=0, end=1, text=" 도와주세요 ")]), SimpleNamespace(
-                language="ko"
-            )
+            segments = [
+                SimpleNamespace(start=0, end=1.02, text=" 도와주세요 "),
+                SimpleNamespace(start=1.02, end=1.04, text=" 잘못된 구간 "),
+            ]
+            return iter(segments), SimpleNamespace(language="ko")
 
     monkeypatch.setattr(library, "WhisperModel", Model)
     stt = WhisperTranscriber(Settings(_env_file=None))
     for _ in range(2):
-        assert stt.transcribe(decode_upload(wave_bytes(), 600), "ko").text == "도와주세요"
+        result = stt.transcribe(decode_upload(wave_bytes(), 600), "ko")
+        assert result.text == "도와주세요"
+        assert result.segments[0].end == 1
     assert calls == [1]

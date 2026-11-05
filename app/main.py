@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -19,8 +20,13 @@ def create_app(settings: Settings | None = None, service: AnalysisService | None
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        yield
-        await service.close()
+        warmup = asyncio.create_task(service.warm_models())
+        try:
+            yield
+        finally:
+            warmup.cancel()
+            await asyncio.gather(warmup, return_exceptions=True)
+            await service.close()
 
     application = FastAPI(
         title="119 긴급 음성 분석 API",

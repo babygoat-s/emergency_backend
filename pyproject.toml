@@ -20,6 +20,8 @@ dependencies = [
 
 [project.optional-dependencies]
 stt = ["faster-whisper>=1.1,<2"]
+symptom = ["torch>=2.6,<3", "transformers>=4.48,<5"]
+speaker = ["faster-whisper>=1.1,<2", "torch>=2.6,<3", "transformers>=4.48,<5"]
 dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
 
 [tool.setuptools.packages.find]

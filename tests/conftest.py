@@ -7,8 +7,16 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.examples import example_analysis
 from app.main import create_app
-from app.schemas import AudioSignals, SpeakerSpan, Symptom, Transcript
+from app.schemas import SpeakerSpan, Symptom, Transcript
 from app.services import AnalysisService
+
+
+@pytest.fixture(autouse=True)
+def allow_mock_cloud_requests(monkeypatch):
+    # Provider tests use synthetic data and mocked HTTP/model clients. Production
+    # defaults remain local-only; privacy tests override these explicitly.
+    monkeypatch.setenv("LLM_PRIVACY_MODE", "redacted_cloud")
+    monkeypatch.setenv("LLM_CLOUD_POLICY_ACKNOWLEDGED", "true")
 
 
 class FakeTranscriber:
@@ -36,8 +44,8 @@ class FakeAnalyzer:
         self.calls = []
         self.started = threading.Event()
 
-    async def analyze(self, text, symptoms, signals):
-        self.calls.append((text, symptoms, signals))
+    async def analyze(self, text, symptoms):
+        self.calls.append((text, symptoms))
         self.started.set()
         return example_analysis().analysis
 
@@ -47,13 +55,6 @@ class FakeClassifier:
 
     def predict(self, text):
         return [Symptom(code="collapse", label="쓰러짐", score=0.92)]
-
-
-class FakeAudioAnalyzer:
-    name = "test-voice-state"
-
-    def analyze(self, audio):
-        return AudioSignals(available=True, provider=self.name, crying_detected=True)
 
 
 class FakeDiarizer:
@@ -68,7 +69,13 @@ class FakeDiarizer:
 
 @pytest.fixture
 def settings():
-    return Settings(_env_file=None, gemini_api_key="", max_upload_mb=1, realtime_window_seconds=0.5)
+    return Settings(
+        _env_file=None,
+        gemini_api_key="",
+        max_upload_mb=1,
+        realtime_window_seconds=0.5,
+        realtime_analysis_min_interval_seconds=0,
+    )
 
 
 @pytest.fixture

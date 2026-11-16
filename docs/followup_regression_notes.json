@@ -1,0 +1,59 @@
+{
+  "case": "user_selected_subway_call",
+  "audio_seconds": 100.8,
+  "symptom_code": "general_weakness",
+  "symptom_threshold": 0.5,
+  "reference_transcript_score": 0.6228,
+  "before": {
+    "model": "small",
+    "file_beam_size": 5,
+    "score": 0.3442,
+    "detected": false,
+    "cer": 0.3079
+  },
+  "after": {
+    "model": "small",
+    "file_beam_size": 1,
+    "score": 0.5918,
+    "detected": true,
+    "cer": 0.3365
+  },
+  "not_adopted": [
+    {
+      "configuration": "small whole-file beam 2 single pass",
+      "score": 0.4042,
+      "detected": false,
+      "cer": 0.2721
+    },
+    {
+      "configuration": "turbo whole-file beam 5",
+      "score": 0.7464,
+      "detected": true,
+      "cer": 0.1862,
+      "processing_seconds_including_load": 122.565
+    }
+  ],
+  "note": "Restored the earlier file beam setting. Classification threshold, eight independent labels, checkpoint and tokenizer unchanged. Overall CER on this case did not improve; recovering the symptom is not proof that every transcript word is correct. No classifier threshold lowering or per-utterance max pooling.",
+  "external_api_called": false,
+  "ui_scroll_checks": [
+    {
+      "state": "at_bottom",
+      "before_count": 30,
+      "after_count": 31,
+      "bottom_gap_pixels": 1
+    },
+    {
+      "state": "reading_earlier",
+      "before_count": 31,
+      "after_count": 32,
+      "scroll_top_before": 2194,
+      "scroll_top_after": 2194
+    },
+    {
+      "state": "returned_to_bottom",
+      "before_count": 32,
+      "after_count": 33,
+      "bottom_gap_pixels": 1
+    }
+  ]
+}

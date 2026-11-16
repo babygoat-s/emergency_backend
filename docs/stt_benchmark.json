@@ -1,0 +1,29 @@
+[
+  {
+    "model": "small",
+    "variant": "previous",
+    "audio_seconds": 13.5,
+    "processing_seconds": 2.811,
+    "realtime_factor": 0.208,
+    "character_error_rate": 0.25,
+    "historical_only": true
+  },
+  {
+    "model": "small",
+    "variant": "tuned",
+    "audio_seconds": 13.5,
+    "processing_seconds": 2.769,
+    "realtime_factor": 0.205,
+    "character_error_rate": 0.2083,
+    "historical_only": true
+  },
+  {
+    "model": "models/whisper-base",
+    "variant": "tuned",
+    "audio_seconds": 13.5,
+    "processing_seconds": 0.831,
+    "realtime_factor": 0.062,
+    "character_error_rate": 0.3333,
+    "historical_only": true
+  }
+]

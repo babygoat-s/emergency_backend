@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.rag.schemas import RagResult
+
 Speaker = Literal["caller", "operator", "unknown"]
 SymptomCode = Literal[
     "collapse",
@@ -14,6 +16,13 @@ SymptomCode = Literal[
     "burn",
     "trauma",
     "other",
+    "fever",
+    "nausea_vomiting",
+    "headache",
+    "abdominal_pain",
+    "dizziness",
+    "laceration",
+    "general_weakness",
 ]
 
 SYMPTOM_LABELS: dict[str, str] = {
@@ -27,6 +36,13 @@ SYMPTOM_LABELS: dict[str, str] = {
     "burn": "화상",
     "trauma": "외상",
     "other": "기타",
+    "fever": "고열",
+    "nausea_vomiting": "구토·오심",
+    "headache": "두통",
+    "abdominal_pain": "복통",
+    "dizziness": "어지러움",
+    "laceration": "열상",
+    "general_weakness": "전신쇠약",
 }
 
 
@@ -40,6 +56,7 @@ class Segment(StrictModel):
     text: str = Field(min_length=1, max_length=20000)
     speaker: Speaker = "unknown"
     speaker_id: str | None = None
+    recognition_status: Literal["recognized", "needs_review", "rechecked"] = "recognized"
 
     @model_validator(mode="after")
     def check_times(self):
@@ -55,6 +72,8 @@ class Transcript(StrictModel):
     segments: list[Segment] = Field(default_factory=list)
     provider: str
     diarization_available: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    revision: int = Field(default=0, ge=0)
 
 
 class Symptom(StrictModel):
@@ -65,12 +84,12 @@ class Symptom(StrictModel):
 
 
 class Urgency(StrictModel):
-    level: Literal["critical", "high", "moderate", "low", "unknown"]
+    level: Literal["minimal", "low", "moderate", "high", "critical", "unknown"]
     reason: str = Field(min_length=1, max_length=1500)
 
 
 class Question(StrictModel):
-    question: str = Field(min_length=1, max_length=500)
+    question: str = Field(min_length=1, max_length=1000)
     purpose: str = Field(min_length=1, max_length=500)
 
 
@@ -78,7 +97,7 @@ class Situation(StrictModel):
     summary: str = Field(min_length=1, max_length=1500)
     symptoms: list[Symptom] = Field(max_length=10)
     urgency: Urgency
-    recommended_questions: list[Question] = Field(min_length=1, max_length=5)
+    recommended_questions: list[Question] = Field(max_length=5)
 
     @field_validator("symptoms")
     @classmethod
@@ -86,14 +105,6 @@ class Situation(StrictModel):
         if len({s.code for s in value}) != len(value):
             raise ValueError("duplicate symptom code")
         return value
-
-
-class AudioSignals(StrictModel):
-    available: bool = False
-    provider: str | None = None
-    speaking_rate_per_minute: float | None = Field(default=None, ge=0)
-    crying_detected: bool | None = None
-    breathing_distress_detected: bool | None = None
 
 
 class SpeakerSpan(StrictModel):
@@ -121,11 +132,12 @@ class AnalysisResponse(StrictModel):
     transcript: Transcript
     analysis: Situation | None = None
     speakers: SpeakerAnalysis = Field(default_factory=SpeakerAnalysis)
-    audio_signals: AudioSignals = Field(default_factory=AudioSignals)
     symptoms: list[Symptom] = Field(default_factory=list)
+    local_questions: list[Question] = Field(default_factory=list)
     symptom_provider: str | None = None
     analysis_provider: str
-    manual_grounded: Literal[False] = False
+    rag: RagResult | None = None
+    manual_grounded: bool = False
     requires_operator_review: Literal[True] = True
     warnings: list[str] = Field(default_factory=list)
 
@@ -153,7 +165,16 @@ class HealthResponse(StrictModel):
     storage: Literal["none"] = "none"
 
 
+class ExamplePreview(StrictModel):
+    quote: str
+    symptom_labels: list[str]
+
+
 class ConfigResponse(StrictModel):
+    llm_privacy_mode: Literal["local_only", "redacted_cloud"] = "local_only"
+    llm_external_enabled: bool = False
+    llm_local_configured: bool = False
+    llm_features_enabled: bool = False
     supported_audio_formats: list[str]
     max_upload_mb: int
     max_audio_seconds: float
@@ -161,12 +182,15 @@ class ConfigResponse(StrictModel):
     transcriber: str
     diarizer: str
     symptom_classifier: str
+    koelectra_symptom_labels: list[str]
+    example_preview: ExamplePreview
     situation_analyzer: str
-    audio_analyzer: str | None
     history_enabled: Literal[False] = False
-    manual_grounded: Literal[False] = False
+    manual_grounded: bool = False
     streaming_mode: Literal["pcm_s16le"] = "pcm_s16le"
     realtime_window_seconds: float
     realtime_analysis_timeout_seconds: float
+    realtime_analysis_min_interval_seconds: float
     realtime_sample_rate: Literal[16000] = 16000
     realtime_channels: Literal[1] = 1
+    rag_enabled: bool = False

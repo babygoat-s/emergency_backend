@@ -1,0 +1,403 @@
+[
+  {
+    "model": "small",
+    "variant": "fixed6:2:6",
+    "text_prompt_enabled": false,
+    "pause_min_seconds": 1.5,
+    "temperature_fallback": false,
+    "context_seconds": 6.0,
+    "carry_pauses": false,
+    "legacy_decoder": false,
+    "audio_seconds": 100.8,
+    "processing_seconds": 63.844,
+    "realtime_factor": 0.633,
+    "character_error_rate": 0.2768,
+    "windows": 17,
+    "window_seconds": [
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      4.8
+    ],
+    "window_quality": [
+      {
+        "start": 0.0,
+        "end": 6.0,
+        "segments": 3,
+        "short_replies": 0,
+        "characters": 21
+      },
+      {
+        "start": 6.0,
+        "end": 12.0,
+        "segments": 4,
+        "short_replies": 1,
+        "characters": 30
+      },
+      {
+        "start": 12.0,
+        "end": 18.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 30
+      },
+      {
+        "start": 18.0,
+        "end": 24.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 29
+      },
+      {
+        "start": 24.0,
+        "end": 30.0,
+        "segments": 4,
+        "short_replies": 0,
+        "characters": 23
+      },
+      {
+        "start": 30.0,
+        "end": 36.0,
+        "segments": 3,
+        "short_replies": 0,
+        "characters": 33
+      },
+      {
+        "start": 36.0,
+        "end": 42.0,
+        "segments": 3,
+        "short_replies": 0,
+        "characters": 39
+      },
+      {
+        "start": 42.0,
+        "end": 48.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 27
+      },
+      {
+        "start": 48.0,
+        "end": 54.0,
+        "segments": 4,
+        "short_replies": 0,
+        "characters": 27
+      },
+      {
+        "start": 54.0,
+        "end": 60.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 23
+      },
+      {
+        "start": 60.0,
+        "end": 66.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 30
+      },
+      {
+        "start": 66.0,
+        "end": 72.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 27
+      },
+      {
+        "start": 72.0,
+        "end": 78.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 12
+      },
+      {
+        "start": 78.0,
+        "end": 84.0,
+        "segments": 0,
+        "short_replies": 0,
+        "characters": 0
+      },
+      {
+        "start": 84.0,
+        "end": 90.0,
+        "segments": 0,
+        "short_replies": 0,
+        "characters": 0
+      },
+      {
+        "start": 90.0,
+        "end": 96.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 10
+      },
+      {
+        "start": 96.0,
+        "end": 100.8,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 19
+      }
+    ]
+  },
+  {
+    "model": "small",
+    "variant": "fixed6:2:0",
+    "text_prompt_enabled": false,
+    "pause_min_seconds": 1.5,
+    "temperature_fallback": false,
+    "context_seconds": 0.0,
+    "carry_pauses": false,
+    "legacy_decoder": false,
+    "audio_seconds": 100.8,
+    "processing_seconds": 51.424,
+    "realtime_factor": 0.51,
+    "character_error_rate": 0.3461,
+    "windows": 17,
+    "window_seconds": [
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      6.0,
+      4.8
+    ],
+    "window_quality": [
+      {
+        "start": 0.0,
+        "end": 6.0,
+        "segments": 3,
+        "short_replies": 0,
+        "characters": 21
+      },
+      {
+        "start": 6.0,
+        "end": 12.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 26
+      },
+      {
+        "start": 12.0,
+        "end": 18.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 30
+      },
+      {
+        "start": 18.0,
+        "end": 24.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 30
+      },
+      {
+        "start": 24.0,
+        "end": 30.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 17
+      },
+      {
+        "start": 30.0,
+        "end": 36.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 35
+      },
+      {
+        "start": 36.0,
+        "end": 42.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 36
+      },
+      {
+        "start": 42.0,
+        "end": 48.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 33
+      },
+      {
+        "start": 48.0,
+        "end": 54.0,
+        "segments": 4,
+        "short_replies": 0,
+        "characters": 29
+      },
+      {
+        "start": 54.0,
+        "end": 60.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 23
+      },
+      {
+        "start": 60.0,
+        "end": 66.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 29
+      },
+      {
+        "start": 66.0,
+        "end": 72.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 27
+      },
+      {
+        "start": 72.0,
+        "end": 78.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 12
+      },
+      {
+        "start": 78.0,
+        "end": 84.0,
+        "segments": 0,
+        "short_replies": 0,
+        "characters": 0
+      },
+      {
+        "start": 84.0,
+        "end": 90.0,
+        "segments": 0,
+        "short_replies": 0,
+        "characters": 0
+      },
+      {
+        "start": 90.0,
+        "end": 96.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 10
+      },
+      {
+        "start": 96.0,
+        "end": 100.8,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 20
+      }
+    ]
+  },
+  {
+    "model": "small",
+    "variant": "fixed12:2:0",
+    "text_prompt_enabled": false,
+    "pause_min_seconds": 1.5,
+    "temperature_fallback": false,
+    "context_seconds": 0.0,
+    "carry_pauses": false,
+    "legacy_decoder": false,
+    "audio_seconds": 100.8,
+    "processing_seconds": 31.809,
+    "realtime_factor": 0.316,
+    "character_error_rate": 0.3341,
+    "windows": 9,
+    "window_seconds": [
+      12.0,
+      12.0,
+      12.0,
+      12.0,
+      12.0,
+      12.0,
+      12.0,
+      12.0,
+      4.8
+    ],
+    "window_quality": [
+      {
+        "start": 0.0,
+        "end": 12.0,
+        "segments": 7,
+        "short_replies": 1,
+        "characters": 50
+      },
+      {
+        "start": 12.0,
+        "end": 24.0,
+        "segments": 2,
+        "short_replies": 0,
+        "characters": 58
+      },
+      {
+        "start": 24.0,
+        "end": 36.0,
+        "segments": 5,
+        "short_replies": 0,
+        "characters": 53
+      },
+      {
+        "start": 36.0,
+        "end": 48.0,
+        "segments": 4,
+        "short_replies": 0,
+        "characters": 63
+      },
+      {
+        "start": 48.0,
+        "end": 60.0,
+        "segments": 3,
+        "short_replies": 0,
+        "characters": 32
+      },
+      {
+        "start": 60.0,
+        "end": 72.0,
+        "segments": 3,
+        "short_replies": 0,
+        "characters": 55
+      },
+      {
+        "start": 72.0,
+        "end": 84.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 12
+      },
+      {
+        "start": 84.0,
+        "end": 96.0,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 10
+      },
+      {
+        "start": 96.0,
+        "end": 100.8,
+        "segments": 1,
+        "short_replies": 0,
+        "characters": 20
+      }
+    ]
+  }
+]

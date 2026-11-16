@@ -1,25 +1,35 @@
 # 119 긴급 음성 통합 분석 백엔드
 
-DB와 분석 기록을 저장하지 않는 FastAPI 서버입니다. Vite + React 프런트엔드는 형제 폴더인 `emergency_frontend`에 있습니다. 파일 분석과 실시간 녹음 분석을 제공하며, 요청·응답 계약은 [API 명세서](docs/API.md)에 정리했습니다.
+FastAPI 기반 음성 분석 및 매뉴얼 근거 후속 질문 추천 서버입니다. 매뉴얼은 로컬 ChromaDB에 인덱싱하고 대화·음성·상담 상태는 요청 메모리에서 처리합니다. Vite + React 프런트엔드는 형제 폴더인 `emergency_frontend`에 있습니다. 파일·실시간 음성과 텍스트 대화를 지원하며, 요청·응답 계약은 [API 명세서](docs/API.md)에 정리했습니다.
+
+**오래된 첨부 매뉴얼을 사용하는 연구용 의사결정 지원 프로토타입입니다. 의료 전문가 검증 전 실제 응급상황에 사용하지 마세요.**
 
 ## 현재 분석 방식
 
+현재 운영 설정은 **요약·긴급도 AI 보류, 외부 LLM 전송 차단**입니다. 변경 근거·실제 음성 시험·남은 한계는 [개인정보와 음성 안정화 기록](docs/PRIVACY_STABILITY.md)을 확인하세요.
+
 | 항목 | 현재 처리 |
 | --- | --- |
-| 음성 → 텍스트 | 로컬 `faster-whisper` (`small`) |
-| 증상 추출 | 별도 증상 분류기 미연결 시 Gemini |
-| 긴급도·상황 요약·확인 질문 | Gemini의 동일한 구조화 분석 호출 |
-| 화자 분류·울음·호흡 상태 | 기본적으로 모델 미연결, 실제 예측 값을 만들지 않음 |
-| 공식 응급 매뉴얼 검색·RAG | 미구현, `manual_grounded=false` |
-| DB·로그인·분석 기록 | 미구현 |
+| 음성 → 텍스트 | 로컬 `faster-whisper` (파일 `small`, 실시간 모델 별도 설정 가능) |
+| 증상 추출 | KoELECTRA 체크포인트를 설정하면 파일과 실시간에 적용 |
+| 후속 질문 | `RAG_ENABLED=true`에서 로컬 상태·원문 조건에 따른 질문 1~3개. 화면에는 질문·문서·쪽수 표시 |
+| 상담 요약·긴급도 AI | 사용자 요청으로 보류. 화면과 다운로드에서 생략 |
+| 상담 상태 | 확인됨·미확인·불확실, 대화 증거와 화자 보존 |
+| 화자 분류 | Wav2Vec2 체크포인트를 설정하면 전사에 신고자·접수 담당자 역할을 표시 |
+| 매뉴얼 검색 | PyMuPDF 표 추출, 한국어 multilingual-e5-small 임베딩, Chroma 메타데이터 필터·의미 검색 |
+| LLM | 현재 `RAG_LLM_PROVIDER=disabled`, `LLM_PRIVACY_MODE=local_only`. 외부 전송 기본 차단 |
 
-기본 Gemini 모델은 `gemini-3.5-flash-lite`이며 `.env`의 `GEMINI_MODEL`이 우선합니다. 현재 증상과 긴급도는 별도 학습 모델의 예측이 아니라 전사 텍스트를 읽은 LLM 결과입니다. 긴급도는 `critical/high/moderate/low/unknown`의 판단 보조 범주이며 KTAS 등급이나 확정 진단이 아닙니다.
+현재는 Whisper → KoELECTRA → 로컬 매뉴얼 검색·분기만 사용합니다. 개인정보가 포함된 대화를 외부 LLM에 전송하지 않습니다. 긴급도는 임의의 로컬 점수로 대체하지 않습니다. 아래 LLM 관련 설정·설명은 추후 별도로 활성화하는 선택 기능입니다. 기존 5단계 UI 범주와 PDF 원문의 긴급·응급·비응급을 자동 매핑하지 않습니다.
 
 증상 코드는 서버의 목록으로 제한합니다. 응답은 `Situation`으로 검증하고, 증상 라벨을 서버 사전으로 교정하며, 원문에 없는 증상 인용은 제거합니다. Gemini가 추출한 증상의 `score`는 항상 `null`입니다. 전송용 JSON Schema는 기본 구조·타입·필수 필드·enum을 사용하며 길이·개수·중복 등 세부 제한은 서버에서 검증합니다.
 
-추후 `CLASSIFIER_FACTORY`로 로컬 증상 분류기를 연결하면 해당 결과를 최종 증상으로 사용하고 Gemini는 계속 긴급도·요약·질문을 생성합니다. 모델 입출력 계약은 [models/README.md](models/README.md)를 참고하세요.
+KoELECTRA는 8개 증상 점수를 독립적으로 계산해 0.5 이상인 항목을 모두 반환합니다. RAG에서는 이 결과를 불확실한 검색 가설로 사용합니다. 환자 상태를 확인된 사실로 만드는 근거는 대화의 실제 응답입니다. `RAG_ENABLED=false`의 기존 Gemini 경로도 개인정보 정책을 통과해야 합니다. 현재 비활성 설정에서는 외부 요청을 하지 않습니다. 모델 입출력 계약은 [models/README.md](models/README.md)를 참고하세요.
+
+KoELECTRA의 분류 대상은 **고열, 구토·오심, 두통, 복통, 어지러움, 열상, 전신쇠약, 호흡곤란**입니다. 화면은 `/api/v1/analysis/config`에서 이 목록을 받아 기능 안내와 체험 카드 사이에 표시합니다. 체험 예시는 고열·구토·두통이 포함된 가상 신고입니다.
 
 ## 실행
+
+PDF 인덱싱·환경변수·텍스트 대화 API·추출 JSON·검토 목록은 [RAG 설치 및 데이터 구조](docs/RAG.md)를 참고하세요. 음성 경로와 텍스트 입력 화면에서 같은 원문 질문 추천을 사용합니다.
 
 Python 3.10 이상을 사용합니다. 프로젝트 가상환경의 Python을 사용하세요.
 
@@ -40,10 +50,10 @@ Swagger: <http://127.0.0.1:8000/docs>. 환경 변수나 `.env`를 바꾼 뒤에�
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev,stt]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,stt,symptom,speaker]"
 ```
 
-`.env`가 없을 때만 `.env.example`을 복사하고 `GEMINI_API_KEY`를 설정합니다. 기존 `.env`와 키는 덮어쓰지 않습니다. IDE 인터프리터도 `.venv\Scripts\python.exe`로 지정합니다. LangChain·PyTorch는 현재 실행에 필요하지 않습니다.
+`.env`가 없을 때 `.env.example`을 복사하고 `GEMINI_API_KEY`를 설정합니다. IDE 인터프리터도 `.venv\Scripts\python.exe`로 지정합니다. KoELECTRA 사용 시 `models`에 체크포인트를 배치하고 `.env`에 `SYMPTOM_MODEL_PATH=models/정리모델_3개.pt`를 설정합니다.
 
 프런트엔드는 별도 터미널에서 실행합니다.
 
@@ -63,12 +73,20 @@ npm run dev
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | 분석 모델 |
 | `GEMINI_TIMEOUT_SECONDS` | `45` | 파일 분석의 Gemini 대기 제한(초) |
 | `WHISPER_MODEL` | `small` | 로컬 STT 모델 또는 모델 폴더 |
+| `WHISPER_REALTIME_MODEL` | 빈 값 | 실시간 모델 이름 또는 폴더. 비워 두거나 `WHISPER_MODEL`과 같으면 파일 모델을 공유 |
+| `WHISPER_CPU_THREADS` | `4` | Whisper의 CPU 작업 스레드 수 |
 | `WHISPER_LOCAL_FILES_ONLY` | `false` | 로컬 가중치만 사용할지 여부 |
+| `SYMPTOM_MODEL_PATH` | 빈 값 | KoELECTRA 체크포인트 경로 |
+| `SYMPTOM_TOKENIZER_PATH` | 빈 값 | 로컬 `config.json` 및 토크나이저 폴더. 비워 두면 체크포인트의 `plm_name` 사용 |
+| `SPEAKER_MODEL_PATH` | 빈 값 | Wav2Vec2 화자 분류 체크포인트 경로 |
+| `SPEAKER_CLASS_ROLES` | `["unknown","unknown"]` | 클래스 0과 1의 역할. 제공된 119 모델은 `["operator","caller"]` 사용 |
 | `MAX_UPLOAD_MB` | `50` | 업로드 제한(MiB) |
 | `MAX_AUDIO_SECONDS` | `600` | 파일·실시간 최대 길이(초) |
-| `REALTIME_WINDOW_SECONDS` | `3` | 실시간 입력 구간 길이, 0.5~3초 |
-| `REALTIME_ANALYSIS_TIMEOUT_SECONDS` | `3` | 실시간 상황 분석 대기 제한(초) |
-| `REALTIME_QUEUE_WINDOWS` | `4` | 대기 중인 로컬 음성 구간 한도 |
+| `REALTIME_WINDOW_SECONDS` | `6` | 실시간 입력 구간의 최대 길이, 0.5~10초 |
+| `REALTIME_PAUSE_SPLIT` | `false` | 짧은 쉼에 따른 조기 분할. 기본 비활성화 |
+| `REALTIME_ANALYSIS_TIMEOUT_SECONDS` | `25` | 실시간 상황 분석 대기 제한(초) |
+| `REALTIME_ANALYSIS_MIN_INTERVAL_SECONDS` | `10` | 녹음 중 한 연결에서 Gemini 상황 분석을 시작하는 최소 간격(초) |
+| `REALTIME_QUEUE_WINDOWS` | `4` | 이전 버전 호환 설정. 임시 CPU 적체로 연결을 종료하지 않음 |
 | `WS_IDLE_TIMEOUT_SECONDS` | `120` | WebSocket 입력 대기 제한(초) |
 
 CORS 기본 허용 origin은 `http://localhost:5173`, `http://127.0.0.1:5173`입니다. WebSocket도 origin을 검사합니다. 업로드 제한·지원 언어·실시간 입력 주기 등 공개 설정은 `/api/v1/analysis/config`에서 확인합니다. 키·파일 분석 대기 제한·CORS 등은 백엔드 설정에서 관리합니다. `/api/v1/health`의 `gemini_configured`는 키 입력 여부만 나타내며 모델 호출 성공을 보장하지 않습니다.
@@ -81,11 +99,15 @@ Whisper 최초 사용 시 가중치 다운로드가 필요할 수 있습니다. 
 
 실시간은 `start → ready → PCM binary → finish → finished` 순서입니다. 브라우저는 16 kHz, 모노, signed PCM16 little-endian을 권장 100ms(3,200바이트), 최대 1초(32,000바이트) 프레임으로 전송합니다. WAV/WebM 헤더와 base64는 전송하지 않습니다.
 
-같은 오디오 구간에서 STT·화자·음성 상태 작업을 병렬 실행하고 `stage=audio`를 먼저 반환합니다. 누적 전사를 기반으로 증상·Gemini 분석을 수행한 뒤 `stage=analysis`를 반환합니다. 전사·화자 구간은 누적되며 음성 상태는 최근 구간 값입니다.
+같은 오디오 구간에서 STT·화자 작업을 병렬 실행하고 `stage=audio`를 먼저 반환합니다. RAG 모드는 이 단계부터 원문 질문을 함께 제공합니다. 로컬 증상 결과와 의미 검색 질문은 `stage=symptoms`, LLM 보조 상태 추출을 반영한 결과는 `stage=analysis`로 반환합니다. 전사·화자 구간은 누적됩니다.
 
-Gemini 대기 중에도 음성 수신과 전사는 계속됩니다. 밀린 Gemini 요청은 최신 누적 전사로 교체하고 원본 음성과 전사를 생략하지 않습니다. `audio(2)` 뒤에 `analysis(1)`이 올 수 있어 프런트엔드는 전사와 분석의 sequence를 따로 관리합니다. 실시간 결과가 이전 구간에 해당하면 화면에 표시합니다.
+증상 분류와 Gemini 대기 중에도 음성 수신과 전사는 계속됩니다. 대기 중인 분석 요청은 최신 누적 전사로 교체합니다. `audio(2)` 뒤에 `analysis(1)`이 올 수 있어 프런트엔드는 전사·증상·분석의 sequence를 따로 관리합니다.
 
-3초는 입력 구간 길이이며 완료 시간 보장이 아닙니다. 실시간 Gemini 대기 제한 초과 시 분석을 `unavailable`로 표시하고 전사를 계속합니다. 로컬 작업 대기열이 한도를 넘으면 연결을 종료합니다. `finish`는 마지막 잔여 음성과 대기 분석까지 처리하고, 연결 해제는 연결별 작업을 취소합니다. 누적 전사는 최대 20,000자입니다.
+Whisper는 새 음성을 기본 최대 6초씩 전사하고 이전 음성 6초를 문맥으로 보존합니다. 짧은 쉼마다 문맥을 끊던 조기 분할은 기본 비활성화했습니다(`REALTIME_PAUSE_SPLIT=false`). 겹친 구간에서만 단어 정렬을 사용하며, 이미 전사한 구간을 제외하고 경계 발화와 실제 반복 응답은 보존합니다. 텍스트 용어 힌트·초기 프롬프트·접두어를 사용하지 않습니다. 실시간 beam 2/파일 beam 1을 적용하며 파일은 저신뢰 디코딩의 재시도와 기본 VAD를 사용합니다. 임시 CPU 적체가 있어도 프레임을 버리거나 연결을 닫지 않습니다. 대기 PCM은 `MAX_AUDIO_SECONDS`로 제한되며 기본 600초는 약 19.2 MB입니다. `finish`는 잔여 음성과 의심 구간의 제한된 로컬 원음 재인식까지 처리합니다. LLM 재시도는 명시적으로 활성화한 경우에만 적용됩니다. 누적 전사는 최대 20,000자입니다.
+
+실시간 분할 회귀의 비교 방법과 한계는 [STT 품질 검증](docs/STT_QUALITY.md)에 기록했습니다. 세 통화 앞부분 120.745초에서 문자 오류율은 57.57% → 37.94%, STT 처리 합계는 98.5초 → 63.0초였습니다. 일부 통화의 오인식은 여전히 많으며 전체 통화 정확도나 화자·LLM까지 포함한 지연을 보장하는 결과가 아닙니다. `tools/benchmark_stt_streaming.py`로 재현할 수 있습니다. 과거 `docs/stt_benchmark.json`은 제거한 용어 힌트가 포함된 역사적 기록이며 현재 품질 근거로 쓰지 않습니다. 힌트 복사 문제의 별도 검증은 `docs/stt_prompt_bias_regression.json`입니다.
+
+Gemini의 응답 시간이 제한을 넘거나 API가 503을 반환하면 상황 분석을 `unavailable`로 표시하며 전사, 로컬 증상 분류, 기본 확인 질문은 계속 표시합니다. 녹음 중 Gemini 호출은 연결당 기본 10초 이상 간격을 두고 최신 누적 전사를 사용합니다. 503 이후에는 5~60초의 서버 공통 대기 시간을 적용하고, 연결이 열려 있으면 새 발화 없이도 최신 전사를 한 번 재시도합니다. 녹음 종료 시 남은 최신 분석을 처리하며, 503 대기 중에는 기본 질문을 남기고 종료합니다. Gemini 응답이 최신 발화까지 도착하면 해당 응답의 질문을 표시합니다. 로컬 분류가 빈 결과를 반환하면 화면에 분류 대상 증상 중 감지된 항목이 없다고 표시합니다.
 
 React 앱의 실제 클라이언트는 `emergency_frontend/src/audio/realtime.js`입니다. [examples/realtime-client.js](examples/realtime-client.js)는 UI와 저장 기능이 없는 참고용 독립 브라우저 클라이언트입니다. 마이크는 localhost 또는 HTTPS에서 사용할 수 있습니다.
 
@@ -105,11 +127,11 @@ REST와 WebSocket의 서버 처리 오류 `message`는 일반 안내 문구로 �
 
 ## 모델 연결과 데이터
 
-`app/models/placeholders.py`에는 STT·화자·음성 상태·증상 모델의 빈 연결 자리만 있습니다. 기본 `TRANSCRIBER_FACTORY`는 빈 값이며 이때 Whisper를 사용합니다. `CLASSIFIER_FACTORY`, `DIARIZER_FACTORY`, `AUDIO_ANALYZER_FACTORY`도 기본 빈 값입니다. 빈 연결 자리를 학습 모델로 교체하는 방법은 모델 문서를 참고하세요.
+`app/models/koelectra.py`에서 체크포인트를 불러와 증상을 분류합니다. `Speaker Diarization.pth`를 `models`에 배치하고 `SPEAKER_MODEL_PATH="models/Speaker Diarization.pth"`와 `SPEAKER_CLASS_ROLES=["operator","caller"]`를 설정하면 Wav2Vec2로 화자를 분류합니다. 사용자 정의 화자 모델은 `DIARIZER_FACTORY`로 연결합니다. `TRANSCRIBER_FACTORY`로 별도 STT를 연결할 수 있습니다.
 
-화자 미연결은 `unknown`, 음성 상태 미연결은 `available=false`와 `null`로 반환합니다. 실제로 측정하지 않은 값을 생성하지 않습니다. 고정 예시는 `is_demo=true`, 제공자는 `example`이며 실제 모델을 호출하지 않습니다.
+화자 결과가 없거나 전사에 여러 화자 구간이 겹치면 해당 화자는 `unknown`입니다. 고정 예시는 `is_demo=true`, 제공자는 `example`입니다.
 
-원본 음성은 백엔드의 로컬 모델에서 처리하며 Gemini에 보내지 않습니다. 전사 텍스트·선택적 증상·음성 신호는 Gemini에 전송합니다. 별도 비식별화 모듈은 없습니다. 업로드는 multipart 파서의 OS 임시 파일을 거칠 수 있고 요청 종료 시 닫습니다. 분석 결과는 메모리에서 처리하며 DB·분석 기록을 저장하지 않습니다.
+원본 음성은 백엔드의 로컬 모델에서 처리하며 Gemini에 보내지 않습니다. 현재 요약·긴급도 LLM은 꺼져 있고 전사·상태를 외부 LLM에 전송하지 않습니다. 개인정보 정책 게이트가 레거시 Gemini 경로에도 적용됩니다. 향후 명시적 외부 활성화 시 식별정보 가림을 적용하지만 완전한 익명화를 보장하지 않습니다. 업로드는 multipart 파서의 OS 임시 파일을 거칠 수 있고 요청 종료 시 닫습니다. 분석 결과는 메모리에서 처리하며 DB·분석 기록을 저장하지 않습니다.
 
 ## 검증
 
@@ -119,4 +141,6 @@ REST와 WebSocket의 서버 처리 오류 `message`는 일반 안내 문구로 �
 .\.venv\Scripts\python.exe -m ruff format --check app tests check_gemini.py
 ```
 
-자동 테스트는 실제 키와 모델 가중치 없이 실행합니다. API·오디오 디코딩·PCM 처리·비동기 작업·SDK 요청 직렬화·오류 메시지 비노출을 확인하며, 의료적 정확성이나 실제 3초 완료 성능을 보장하는 검증은 아닙니다.
+자동 테스트는 실제 키와 모델 가중치 없이 실행하며 API·오디오 디코딩·PCM 처리·비동기 작업·SDK 요청 직렬화·오류 메시지 비노출을 확인합니다.
+
+긴급도 5단계는 RAG 여부와 관계없이 LLM 응답만 사용합니다. 로컬 증상·매뉴얼 규칙은 긴급도 단계를 지정하거나 덮어쓰지 않습니다. LLM 실패·미설정 시 단계는 미완료로 표시합니다. 음성에서 호흡·울음·말속도를 추정하는 모듈·API 필드·설정은 제거했습니다.

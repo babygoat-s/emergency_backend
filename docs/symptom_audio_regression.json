@@ -1,0 +1,17 @@
+{
+  "model": "small",
+  "beam_size": 1,
+  "audio_seconds": 100.8,
+  "symptom_threshold": 0.5,
+  "symptoms": [
+    {
+      "code": "general_weakness",
+      "label": "전신쇠약",
+      "evidence": null,
+      "score": 0.5917858481407166
+    }
+  ],
+  "expected_detected": true,
+  "transcription_warnings": [],
+  "external_api_called": false
+}

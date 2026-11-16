@@ -9,6 +9,13 @@ from starlette.concurrency import run_in_threadpool
 from app.audio import BYTES_PER_SECOND, AudioInput
 from app.errors import ServiceError
 from app.providers.whisper import WhisperTranscriber
+from app.recognition_quality import (
+    REVIEW_FAILED,
+    REVIEW_WARNING,
+    is_acknowledgement,
+    suspicious_reply_runs,
+    trusted_text,
+)
 from app.schemas import AnalysisResponse, Question, StreamStart
 from app.services import AnalysisService, assign_speaker
 
@@ -46,6 +53,9 @@ class RealtimeSession:
         self.windows_processed = 0
         self.cumulative: AnalysisResponse | None = None
         self.speaker_state = {}
+        self.raw_pcm = bytearray()
+        self.pending_audio = None
+        self.audio_eof = False
 
     async def send(self, message: dict):
         async with self.send_lock:
@@ -85,6 +95,7 @@ class RealtimeSession:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self.raw_pcm.clear()
 
     def enqueue_audio(self, pcm: bytes, offset: float):
         self.audio_queue.put_nowait(AudioInput(pcm=pcm, start_seconds=offset))
@@ -126,6 +137,7 @@ class RealtimeSession:
             if self.total_bytes / BYTES_PER_SECOND > self.settings.max_audio_seconds:
                 raise ServiceError(413, "STREAM_LIMIT", "최대 실시간 음성 길이를 초과했습니다.")
             buffer.extend(pcm)
+            self.raw_pcm.extend(pcm)
             while len(buffer) >= self.window_bytes:
                 self.enqueue_audio(bytes(buffer[: self.window_bytes]), offset)
                 del buffer[: self.window_bytes]
@@ -144,6 +156,12 @@ class RealtimeSession:
     ) -> AnalysisResponse:
         previous = self.cumulative
         transcript = current.transcript.model_copy(deep=True)
+        if previous:
+            transcript.revision = previous.transcript.revision
+            transcript.warnings = list(
+                dict.fromkeys(previous.transcript.warnings + transcript.warnings)
+            )
+            current.warnings = list(dict.fromkeys(current.warnings + transcript.warnings))
         transcript.text = " ".join(
             filter(
                 None,
@@ -178,8 +196,30 @@ class RealtimeSession:
         transcript.segments = (previous.transcript.segments if previous else []) + segments
         transcript.diarization_available = speakers.available
         current.transcript, current.speakers = transcript, speakers
-        self.cumulative = current.model_copy(deep=True)
         return current
+
+    @staticmethod
+    def flag_uncertain_replies(result):
+        # Previous segments are shared by snapshots. Replace suspect segments
+        # instead of altering them before the completed update is published.
+        transcript = result.transcript
+        suspicious = {
+            id(segment)
+            for run in suspicious_reply_runs(transcript.segments)
+            for segment in run
+            if segment.recognition_status == "recognized"
+        }
+        if suspicious:
+            transcript.segments = [
+                s.model_copy(update={"recognition_status": "needs_review"})
+                if id(s) in suspicious
+                else s
+                for s in transcript.segments
+            ]
+            transcript.revision += 1
+            transcript.text = trusted_text(transcript)
+            transcript.warnings = list(dict.fromkeys(transcript.warnings + [REVIEW_WARNING]))
+            result.warnings = list(dict.fromkeys(result.warnings + [REVIEW_WARNING]))
 
     @staticmethod
     def enqueue_latest(queue: asyncio.Queue, item):
@@ -206,10 +246,26 @@ class RealtimeSession:
         committed_end = 0.0
         use_context = isinstance(self.service.realtime_transcriber, WhisperTranscriber)
         while True:
-            audio = await self.audio_queue.get()
+            audio = await self.take_audio()
             if audio is None:
+                await self.recheck_suspicious_audio()
                 await self.symptom_queue.put(None)
                 return
+            sequence = self.windows_processed + 1
+            window = {
+                "start": audio.start_seconds,
+                "end": audio.start_seconds + audio.duration_seconds,
+            }
+            context_seconds = len(context) / BYTES_PER_SECOND
+            transcript_sent = False
+
+            async def publish_transcript(early):
+                nonlocal transcript_sent
+                early = self.accumulate(early, audio, context_seconds)
+                self.flag_uncertain_replies(early)
+                await self.send_update("transcript", sequence, window, early)
+                transcript_sent = True
+
             result = await self.service.local_analysis(
                 audio,
                 self.start.language,
@@ -217,9 +273,15 @@ class RealtimeSession:
                 realtime=True,
                 stt_context=context,
                 committed_end=committed_end,
+                on_transcript=publish_transcript if use_context else None,
             )
             has_speech = bool(result.transcript.text)
-            result = self.accumulate(result, audio, len(context) / BYTES_PER_SECOND)
+            if use_context and has_speech and self.settings.rag_enabled and not transcript_sent:
+                await publish_transcript(result.model_copy())
+            result = self.accumulate(result, audio, context_seconds)
+            if use_context:
+                self.flag_uncertain_replies(result)
+            self.cumulative = result.model_copy(deep=True)
             if result.transcript.segments:
                 committed_end = result.transcript.segments[-1].end
             # A short pause need not end the sentence. Keep acoustic context at
@@ -233,15 +295,142 @@ class RealtimeSession:
                     await self.service.prepare_rag(result, semantic=False)
                 else:
                     result.local_questions = local_questions()
-            self.windows_processed += 1
-            sequence = self.windows_processed
-            window = {
-                "start": audio.start_seconds,
-                "end": audio.start_seconds + audio.duration_seconds,
-            }
+            self.windows_processed = sequence
             await self.send_update("audio", sequence, window, result)
             if has_speech:
                 self.enqueue_latest(self.symptom_queue, (sequence, window, result))
+
+    async def take_audio(self):
+        """Catch up using contiguous PCM, never by dropping or speeding up audio."""
+        if self.audio_eof:
+            return None
+        audio = self.pending_audio
+        self.pending_audio = None
+        if audio is None:
+            audio = await self.audio_queue.get()
+        if audio is None:
+            self.audio_eof = True
+            return None
+        if not self.settings.realtime_adaptive_batch or not isinstance(
+            self.service.realtime_transcriber, WhisperTranscriber
+        ):
+            return audio
+        pcm = bytearray(audio.pcm)
+        for _ in range(2):
+            try:
+                following = self.audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if following is None:
+                self.audio_eof = True
+                break
+            expected = audio.start_seconds + len(pcm) / BYTES_PER_SECOND
+            if (
+                abs(following.start_seconds - expected) > 0.001
+                or (len(pcm) + len(following.pcm)) / BYTES_PER_SECOND
+                > self.settings.realtime_batch_seconds
+            ):
+                self.pending_audio = following
+                break
+            pcm.extend(following.pcm)
+        return AudioInput(pcm=bytes(pcm), start_seconds=audio.start_seconds)
+
+    async def recheck_suspicious_audio(self):
+        """One bounded, local audio review before finish; replace the time range."""
+        if (
+            not self.settings.realtime_review_enabled
+            or not self.cumulative
+            or not isinstance(self.service.realtime_transcriber, WhisperTranscriber)
+        ):
+            return
+        runs = [
+            run
+            for run in suspicious_reply_runs(self.cumulative.transcript.segments)
+            if any(s.recognition_status == "needs_review" for s in run)
+        ]
+        if not runs or not self.raw_pcm:
+            return
+        run = max(runs, key=len)
+        before = max(0, run[0].start - 6)
+        after = run[-1].end + 3
+        overlapping = [
+            s for s in self.cumulative.transcript.segments if s.end > before and s.start < after
+        ]
+        selected = [s for s in overlapping if s.end - overlapping[0].start <= 24]
+        if not selected:
+            return
+        left, right = selected[0].start, selected[-1].end
+        pad = min(6, max(0, (30 - (right - left)) / 2))
+        audio_left = max(0, left - pad)
+        audio_right = min(len(self.raw_pcm) / BYTES_PER_SECOND, right + pad)
+        audio = AudioInput(
+            pcm=bytes(self.raw_pcm[int(audio_left * 16000) * 2 : int(audio_right * 16000) * 2])
+        )
+        await self.send({"type": "reviewing", "range": {"start": left, "end": right}})
+        try:
+            review = await self.service.recheck_audio(
+                audio,
+                self.start.language,
+                word_cutoff=left - audio_left,
+                end_cutoff=right - audio_left,
+            )
+        except ServiceError:
+            review = None
+        result = self.cumulative.model_copy(deep=True)
+        if (
+            review is None
+            or not review.text
+            or all(is_acknowledgement(s.text) for s in review.segments)
+        ):
+            result.warnings = list(dict.fromkeys(result.warnings + [REVIEW_FAILED]))
+        else:
+            replacement = [
+                s.model_copy(
+                    update={
+                        "start": s.start + audio_left,
+                        "end": s.end + audio_left,
+                        "recognition_status": "rechecked",
+                    }
+                )
+                for s in review.segments
+            ]
+            for segment in replacement:
+                assign_speaker(segment, result.speakers.segments, result.speakers.available)
+            for repeated in suspicious_reply_runs(replacement):
+                for segment in repeated:
+                    segment.recognition_status = "needs_review"
+            # A reviewer may return only the middle of the requested interval.
+            # Retain original segments for which it returned no overlapping audio.
+            retained = [
+                s
+                for s in result.transcript.segments
+                if not any(r.start < s.end and r.end > s.start for r in replacement)
+            ]
+            result.transcript.segments = sorted(
+                retained + replacement, key=lambda s: (s.start, s.end)
+            )
+            result.transcript.text = trusted_text(result.transcript)
+            result.transcript.warnings.extend(review.warnings)
+            result.warnings.extend(review.warnings)
+            if not any(s.recognition_status == "needs_review" for s in result.transcript.segments):
+                result.transcript.warnings = [
+                    w for w in result.transcript.warnings if w != REVIEW_WARNING
+                ]
+                result.warnings = [w for w in result.warnings if w != REVIEW_WARNING]
+            else:
+                result.warnings = list(dict.fromkeys(result.warnings + [REVIEW_FAILED]))
+        result.transcript.revision += 1
+        result.symptoms, result.symptom_provider, result.analysis, result.rag = [], None, None, None
+        result.local_questions = []
+        result.manual_grounded = False
+        if result.transcript.text and self.settings.rag_enabled:
+            await self.service.prepare_rag(result, semantic=False)
+        self.cumulative = result.model_copy(deep=True)
+        self.windows_processed += 1
+        window = {"start": 0, "end": len(self.raw_pcm) / BYTES_PER_SECOND}
+        await self.send_update("audio", self.windows_processed, window, result)
+        if result.transcript.text:
+            self.enqueue_latest(self.symptom_queue, (self.windows_processed, window, result))
 
     async def process_symptoms(self):
         while True:
@@ -288,12 +477,29 @@ class RealtimeSession:
                 retrying = False
 
             sequence, window, snapshot = item
-            request_at = loop.time() + self.settings.realtime_analysis_min_interval_seconds
+            interval = (
+                0
+                if self.settings.rag_enabled and self.settings.rag_llm_provider == "disabled"
+                else self.settings.realtime_analysis_min_interval_seconds
+            )
+            request_at = loop.time() + interval
             retry_at = 0.0
             error = None
+            defer_semantic = (
+                not finishing
+                and self.settings.rag_enabled
+                and self.settings.rag_llm_provider == "disabled"
+                and self.total_bytes / BYTES_PER_SECOND - window["end"]
+                >= self.settings.realtime_window_seconds
+            )
             try:
+                # Keep structural manual questions available while Whisper catches up.
+                if defer_semantic:
+                    completion = self.service.complete(snapshot, semantic=False)
+                else:
+                    completion = self.service.complete(snapshot)
                 result = await asyncio.wait_for(
-                    self.service.complete(snapshot),
+                    completion,
                     timeout=self.settings.realtime_analysis_timeout_seconds,
                 )
             except asyncio.TimeoutError:
@@ -325,5 +531,9 @@ class RealtimeSession:
             if not retry_at or retrying:
                 item = await self.analysis_queue.get()
                 retrying = False
+                if item is None and defer_semantic:
+                    # A silent tail might not have queued another transcript.
+                    item = (sequence, window, snapshot)
+                    input_ended = True
             else:
                 retrying = True

@@ -42,8 +42,27 @@ async def health(service: Service):
 async def config(service: Service):
     settings = service.settings
     demo = example_analysis()
+    from app.privacy import is_loopback_endpoint
+
+    local_llm = settings.rag_llm_provider == "openai_compatible" and is_loopback_endpoint(
+        settings.rag_llm_base_url
+    )
     return {
         "supported_audio_formats": list(SUPPORTED_EXTENSIONS),
+        "llm_privacy_mode": settings.llm_privacy_mode,
+        "llm_local_configured": local_llm,
+        "llm_features_enabled": settings.rag_llm_provider != "disabled"
+        and (
+            local_llm
+            or (
+                settings.llm_privacy_mode == "redacted_cloud"
+                and settings.llm_cloud_policy_acknowledged
+            )
+        ),
+        "llm_external_enabled": not local_llm
+        and settings.rag_llm_provider != "disabled"
+        and settings.llm_privacy_mode == "redacted_cloud"
+        and settings.llm_cloud_policy_acknowledged,
         "max_upload_mb": settings.max_upload_mb,
         "max_audio_seconds": settings.max_audio_seconds,
         "languages": ["ko", "en", "ja", "auto"],

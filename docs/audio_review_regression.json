@@ -1,0 +1,25 @@
+{
+  "test_kind": "controlled_fault_original_audio_review",
+  "microphone_fault_reproduced": false,
+  "injected_range_seconds": [
+    48,
+    66
+  ],
+  "review_model": "models/whisper-turbo",
+  "processing_seconds": 50.302,
+  "recovered_segments": 11,
+  "recovered_characters": 169,
+  "approximate_interval_CER": 0.2932,
+  "symptoms_from_recovered_audio_only": [
+    {
+      "code": "general_weakness",
+      "label": "전신쇠약",
+      "evidence": null,
+      "score": 0.8107612133026123
+    }
+  ],
+  "unresolved_segments": 2,
+  "transcript_revision": 2,
+  "external_api_called": false,
+  "note": "CER is approximate: reference segments can cross reviewed time boundaries."
+}

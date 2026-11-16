@@ -5,6 +5,10 @@ import re
 from app.rag.schemas import ManualChunk
 
 FIELD_PATTERNS = [
+    ("symptom_onset", r"언제 증상이 생겼"),
+    ("speech_difficulty", r"말을 못하거나 발음"),
+    ("paralysis", r"얼굴이나 사지에 마비"),
+    ("sensory_change", r"사지에 저린감|감각이 이상"),
     ("location", r"발생한 위치|정확한.*위치"),
     ("callback", r"전화번호"),
     ("scene_safety", r"안전합니까"),
@@ -37,7 +41,16 @@ SYMPTOM_PROTOCOLS = {
 # Lexical routes are hypotheses for retrieval. They never establish a diagnosis.
 PROTOCOL_ALIASES = {
     "P01": ["기도 이물", "기도이물", "목에 걸"],
-    "P02": ["뇌졸중", "편마비", "한쪽 마비"],
+    "P02": [
+        "뇌졸중",
+        "편마비",
+        "한쪽 마비",
+        "팔이 마비",
+        "팔 마비",
+        "다리가 마비",
+        "마비가",
+        "팔에 마비",
+    ],
     "P03": ["두통", "머리가 아", "머리 아"],
     "P04": ["발열", "고열", "열이", "열은"],
     "P05": ["경련", "발작"],

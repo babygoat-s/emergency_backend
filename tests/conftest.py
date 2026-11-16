@@ -11,6 +11,14 @@ from app.schemas import SpeakerSpan, Symptom, Transcript
 from app.services import AnalysisService
 
 
+@pytest.fixture(autouse=True)
+def allow_mock_cloud_requests(monkeypatch):
+    # Provider tests use synthetic data and mocked HTTP/model clients. Production
+    # defaults remain local-only; privacy tests override these explicitly.
+    monkeypatch.setenv("LLM_PRIVACY_MODE", "redacted_cloud")
+    monkeypatch.setenv("LLM_CLOUD_POLICY_ACKNOWLEDGED", "true")
+
+
 class FakeTranscriber:
     name = "test-stt"
 

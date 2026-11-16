@@ -56,6 +56,7 @@ class Segment(StrictModel):
     text: str = Field(min_length=1, max_length=20000)
     speaker: Speaker = "unknown"
     speaker_id: str | None = None
+    recognition_status: Literal["recognized", "needs_review", "rechecked"] = "recognized"
 
     @model_validator(mode="after")
     def check_times(self):
@@ -71,6 +72,8 @@ class Transcript(StrictModel):
     segments: list[Segment] = Field(default_factory=list)
     provider: str
     diarization_available: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    revision: int = Field(default=0, ge=0)
 
 
 class Symptom(StrictModel):
@@ -168,6 +171,10 @@ class ExamplePreview(StrictModel):
 
 
 class ConfigResponse(StrictModel):
+    llm_privacy_mode: Literal["local_only", "redacted_cloud"] = "local_only"
+    llm_external_enabled: bool = False
+    llm_local_configured: bool = False
+    llm_features_enabled: bool = False
     supported_audio_formats: list[str]
     max_upload_mb: int
     max_audio_seconds: float

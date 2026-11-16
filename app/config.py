@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     whisper_compute_type: str = "int8"
     whisper_local_files_only: bool = False
     whisper_cpu_threads: int = Field(default=4, ge=1, le=32)
-    whisper_beam_size: int = Field(default=5, ge=1, le=10)
+    whisper_beam_size: int = Field(default=1, ge=1, le=10)
     whisper_realtime_beam_size: int = Field(default=2, ge=1, le=5)
     torch_cpu_threads: int = Field(default=2, ge=1, le=16)
     transcriber_factory: str = ""
@@ -51,11 +51,17 @@ class Settings(BaseSettings):
     rag_llm_provider: Literal["gemini", "openai_compatible", "disabled"] = "gemini"
     rag_llm_model: str = ""
     rag_llm_api_key: SecretStr = SecretStr("")
-    rag_llm_base_url: str = "http://localhost:11434/v1"
+    rag_llm_base_url: str = "http://127.0.0.1:11434/v1"
     rag_llm_timeout_seconds: float = Field(default=20, gt=0, le=60)
     rag_llm_attempt_timeout_seconds: float = Field(default=10, gt=0, le=60)
     rag_llm_max_retries: int = Field(default=1, ge=0, le=2)
     rag_llm_fallback_models: list[str] = ["gemini-3.1-flash-lite"]
+    llm_privacy_mode: Literal["local_only", "redacted_cloud"] = "local_only"
+    llm_cloud_policy_acknowledged: bool = False
+    whisper_repair_model: str = ""
+    realtime_adaptive_batch: bool = True
+    realtime_batch_seconds: float = Field(default=18, ge=6, le=24)
+    realtime_review_enabled: bool = True
 
     @property
     def max_upload_bytes(self) -> int:

@@ -7,7 +7,9 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from app.audio import BYTES_PER_SECOND
 from app.errors import ServiceError
+from app.examples import example_analysis
 from app.main import create_app
 from app.models.koelectra import KoElectraClassifier
 from app.models.placeholders import SpeakerModel, SpeechModel, SymptomModel
@@ -34,6 +36,69 @@ def begin(ws):
     ready = ws.receive_json()
     assert ready["type"] == "ready"
     return ready
+
+
+def test_whisper_transcript_is_sent_before_slow_speaker_and_keeps_same_sequence(settings):
+    settings.rag_llm_provider = "disabled"
+    transcriber = WhisperTranscriber(settings)
+    transcriber.transcribe = lambda audio, language, **_: FakeTranscriber().transcribe(
+        audio, language
+    )
+    release_speaker = threading.Event()
+
+    def diarize(audio, state):
+        assert release_speaker.wait(timeout=5)
+        return FakeDiarizer().diarize(audio, state)
+
+    service = AnalysisService(
+        settings, transcriber=transcriber, diarizer=SimpleNamespace(name="test", diarize=diarize)
+    )
+    transcriber.warmup = lambda: None
+    with TestClient(create_app(settings, service)) as client, client.websocket_connect(PATH) as ws:
+        begin(ws)
+        try:
+            ws.send_bytes(PCM)
+            first = ws.receive_json()
+            assert first["stage"] == "transcript"
+            assert first["data"]["transcript"]["segments"][0]["speaker"] == "unknown"
+        finally:
+            release_speaker.set()
+        complete = ws.receive_json()
+        assert complete["stage"] == "audio" and complete["sequence"] == first["sequence"]
+        assert complete["data"]["transcript"]["text"] == first["data"]["transcript"]["text"]
+        assert complete["data"]["transcript"]["segments"][0]["speaker"] == "caller"
+        ws.send_json({"type": "finish"})
+        assert ws.receive_json()["stage"] == "analysis"
+        assert ws.receive_json()["type"] == "finished"
+
+
+def test_local_search_defers_embeddings_during_backlog_and_finishes_after_silent_tail(backend):
+    service = backend.service
+    service.settings.rag_enabled = True
+    service.settings.rag_llm_provider = "disabled"
+    snapshot = example_analysis()
+    calls = []
+    sent = []
+
+    async def complete(result, *, semantic=True):
+        calls.append(semantic)
+        return result
+
+    async def send(event):
+        sent.append(event)
+
+    async def run():
+        service.complete = complete
+        session = RealtimeSession(
+            SimpleNamespace(send_json=send), service, StreamStart(type="start")
+        )
+        session.total_bytes = 2 * BYTES_PER_SECOND
+        session.analysis_queue.put_nowait((1, {"start": 0, "end": 0.5}, snapshot))
+        await asyncio.gather(session.process_analyses(), session.analysis_queue.put(None))
+
+    asyncio.run(run())
+    assert calls == [False, True]
+    assert [event["sequence"] for event in sent] == [1, 1]
 
 
 def test_continuous_audio_and_full_updates(backend):
@@ -591,6 +656,9 @@ def test_disconnect_cancels_pending_gemini(backend):
         ws.send_bytes(PCM)
         ws.receive_json()
         assert started.wait(2)
+        # Deliver the actual disconnect before TestClient cancels its ASGI task.
+        ws.close()
+        assert cancelled.wait(2)
     assert cancelled.wait(2)
 
 

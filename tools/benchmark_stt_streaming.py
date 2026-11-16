@@ -8,7 +8,7 @@ from time import perf_counter
 from app.audio import BYTES_PER_SECOND, AudioInput, decode_upload
 from app.config import Settings
 from app.providers.whisper import WhisperTranscriber
-from tools.benchmark_stt import cer
+from tools.benchmark_stt import cer, normalize
 
 
 def windows(pcm, seconds, pauses, transcriber, pause_min=1.5):
@@ -79,7 +79,7 @@ def main():
         settings.whisper_realtime_beam_size = int(beam)
         settings.whisper_beam_size = int(beam)
         start = perf_counter()
-        texts, lengths = [], []
+        texts, lengths, detail = [], [], []
         if mode == "file":
             texts.append(transcriber.transcribe(AudioInput(pcm), "ko").text)
             lengths.append(len(pcm) / BYTES_PER_SECOND)
@@ -100,11 +100,23 @@ def main():
                 )
                 texts.append(result.text)
                 lengths.append(audio.duration_seconds)
+                detail.append(
+                    {
+                        "start": audio.start_seconds,
+                        "end": audio.start_seconds + audio.duration_seconds,
+                        "segments": len(result.segments),
+                        "short_replies": sum(
+                            normalize(s.text) in {"네", "예", "아네", "네네", "맞아요"}
+                            for s in result.segments
+                        ),
+                        "characters": len(normalize(result.text)),
+                    }
+                )
                 if result.segments:
                     committed = offset + result.segments[-1].end
                 context = (
                     (context + audio.pcm)[-int(context_limit * BYTES_PER_SECOND) :]
-                    if fixed or args.carry_pauses
+                    if context_limit > 0 and (fixed or args.carry_pauses)
                     else b""
                 )
         elapsed = perf_counter() - start
@@ -123,6 +135,7 @@ def main():
             "character_error_rate": cer(reference, " ".join(texts)),
             "windows": len(lengths),
             "window_seconds": [round(length, 2) for length in lengths],
+            "window_quality": detail,
         }
         metrics.append(metric)
         Path(args.output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")

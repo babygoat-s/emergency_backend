@@ -1,5 +1,4 @@
 import json
-from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 
@@ -27,7 +26,6 @@ class Embeddings:
                 show_progress_bar=False,
             ).tolist()
 
-    @lru_cache(maxsize=16)
     def query(self, text: str):
         with self.lock:
             return self.model.encode(

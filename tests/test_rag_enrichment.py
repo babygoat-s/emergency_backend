@@ -9,9 +9,30 @@ from langchain_core.runnables import RunnableLambda
 
 from app.config import Settings
 from app.rag.chain import GroundedChain
-from app.rag.enrichment import Extraction, supported_summary, supported_urgency
+from app.rag.enrichment import Extraction, question_text, supported_summary, supported_urgency
 from app.rag.llm import SYSTEM, RagLLM, error_details, response_schema
 from app.rag.schemas import ConsultationState, RagResult, Turn
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (
+            "환자가 쓰러져 있고 경련이 보고된 상태에서 현재 의식 여부를 확인해야 합니다. "
+            "환자분은 지금 의식이 또렷한 상태인가요?",
+            "환자분은 지금 의식이 또렷한 상태인가요?",
+        ),
+        (
+            "지금 어디에 계신가요? 연락 가능한 번호가 어떻게 되나요?",
+            "지금 어디에 계신가요? 연락 가능한 번호가 어떻게 되나요?",
+        ),
+        ("현재 의식 여부를 확인해야 합니다.", ""),
+        ("설명입니다.환자분은 지금 의식이 또렷한가요?", "환자분은 지금 의식이 또렷한가요?"),
+        ("체온이 38.5도인가요?", "체온이 38.5도인가요?"),
+    ],
+)
+def test_read_aloud_questions_exclude_explanatory_preambles(text, expected):
+    assert question_text(text) == expected
 
 
 def test_summary_requires_literal_evidence_and_no_unsupported_numbers():

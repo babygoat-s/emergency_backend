@@ -1,6 +1,7 @@
 import re
 
 from app.rag.extract import compact
+from app.rag.question_bank import local_question
 from app.rag.rules import PROTOCOL_ALIASES, field_for
 from app.rag.schemas import ConsultationState, ManualChunk, Observation, Turn
 
@@ -22,8 +23,24 @@ BASE_FIELDS = [
     "severe_bleeding",
     "pregnancy",
     "trauma",
+    "speech_difficulty",
+    "paralysis",
+    "sensory_change",
+    "symptom_onset",
 ]
 FACT_PATTERNS = {
+    "speech_difficulty": [
+        ("no", r"말.*(?:문제 없|잘 하)|발음.*정확"),
+        ("yes", r"말을?\s*(?:못하|못해)|발음.*(?:이상|부정확|안 되|어눌)"),
+    ],
+    "paralysis": [
+        ("no", r"마비.*(?:없|아니|않)"),
+        ("yes", r"(?:얼굴|팔|다리|사지).{0,12}마비|마비(?:가|는|이)?\s*(?:왔|생|있|됐|되|온)"),
+    ],
+    "sensory_change": [
+        ("no", r"저리.*않|저린.*없|감각.*정상"),
+        ("yes", r"(?:팔|다리|사지|손|발).*(?:저리|저린)|감각.*이상"),
+    ],
     "consciousness": [
         ("absent", r"(?:의식|반응)(?:이|은|가)?\s*없|깨워도.*(?:안|못).*일어"),
         ("altered", r"의식.*(?:흐리|혼미|명료하지|또렷하지)"),
@@ -96,7 +113,10 @@ def update_state(
             if "?" in text or re.search(r"습니까|나요|세요", text):
                 for question in questions:
                     phrase = compact(re.sub(r"^\([^)]*\)|^[a-d][.]", "", question.text))
-                    if phrase and phrase in compact(text):
+                    phrased = compact(local_question(question))
+                    if (phrase and phrase in compact(text)) or (
+                        phrased and phrased in compact(text)
+                    ):
                         state.asked_question_ids.append(question.source.question_id)
                         pending_field = field_for(question)
                         pending_normal_breathing = (
@@ -160,6 +180,13 @@ def update_state(
                         protocols.add(protocol)
                         record("chief_complaint", text[:500], clause)
                         record(f"protocol:{protocol}", "yes", clause)
+            if re.search(r"마비|발음|저리|증상", clause):
+                onset = re.search(r"\d+\s*(?:분|시간|일)\s*전|방금|오늘\s*아침|어제", clause)
+                if onset:
+                    record("symptom_onset", onset[0], clause)
+            paralysis = state.fields.get("paralysis", Observation())
+            if paralysis.value == "yes":
+                protocols.add("P02")
         age = re.search(r"(?<!\d)(\d{1,3})\s*(?:살|세)(?!요)", text)
         if age and int(age[1]) <= 120:
             record("age", age[1], next(part for part in clauses if age[0] in part))

@@ -7,6 +7,8 @@ from time import monotonic
 
 import httpx
 
+from app.errors import ServiceError
+from app.privacy import prepare_llm_payload, require_llm_destination
 from app.providers.gemini import gemini_error_reason, gemini_response_schema
 from app.rag.enrichment import Enrichment, Extraction, supported_summary, supported_urgency
 from app.rag.schemas import Observation
@@ -41,12 +43,11 @@ summary_evidence에 요약을 뒷받침하는 실제 발화의 turn_id와 원문
 
 3. questions: source_candidates의 각 미확인 항목을 source_context와 현재 대화에 근거해
 상담원이 바로 읽을 수 있는 구체적인 한국어 질문으로 작성한다.
-각 항목은 2~3문장으로, 먼저 이미 보고된 상황을 짚고 이어서 확인할 내용을 구체적으로 묻는다.
+각 항목은 신고자에게 바로 읽을 확인 질문만 1~2문장으로 작성한다.
 근거가 짧으면 억지로 늘리거나 같은 질문을 반복하지 않는다. 문장 수보다 실제 확인 내용이 우선이다.
-context에는 확인된 신고 상황과 이 항목에서 확인할 내용을 연결한 설명을 한 문장으로 작성한다.
-context에는 보고된 사실·미확인 항목만 쓴다. 의학적 원인·진단·질환 가능성을 설명하지 않는다.
-question에는 실제로 신고자에게 읽을 확인 질문을 1~2문장으로 작성한다.
-context를 비우거나 question에 원문의 짧은 문장만 그대로 복사하지 않는다.
+context는 빈 문자열로 둔다.
+상황 설명이나 "확인해야 합니다" 같은 추천 이유를 질문 앞에 붙이지 않는다.
+question에는 의문문만 넣는다. 질문은 구체적으로 작성하되 설명문·서론·진단을 넣지 않는다.
 단순히 "숨을 쉽니까?", "의식이 있습니까?"를 복사하지 말고 신고된 증상·대상·시점과
 매뉴얼의 해당 확인 내용을 연결한다. 예: 대화에서 두통이 보고되고 원문이 의식 확인이면
 "두통이 있는 환자분은 지금 의식이 또렷한 상태인가요?"처럼 확인 대상과 현재 상태를 명확히 한다.
@@ -73,7 +74,7 @@ reason에는 단계 번호나 분류 체계 설명 대신, 보고된 상태에 �
 증상 모델의 추정이나 상담원의 질문을 확정 사실로 쓰지 않는다. origin은 llm이다.
 requires_immediate_operator_review가 true면 추가 질문 생성은 생략하고 요약·근거 정리만 한다.
 task가 rewrite_questions_only면 서버가 검증한 미확인 후보만 전달한 것이다.
-이때 후보를 다시 생략하지 말고 모든 source_candidates에 context와 구체적인 question을 작성한다.
+이때 후보를 다시 생략하지 말고 모든 source_candidates에 구체적인 question만 작성한다.
 facts/protocol_order/summary_evidence는 빈 배열, summary는 빈 문자열, urgency는 unknown으로 둔다.
 
 출력은 facts, protocol_order, summary, summary_evidence, questions, urgency를 가진 JSON 하나다.
@@ -148,6 +149,12 @@ class RagLLM:
         fallback = Enrichment(state=state, status="disabled")
         if provider == "disabled":
             return fallback
+        try:
+            require_llm_destination(self.settings, provider)
+        except ServiceError:
+            return fallback.model_copy(
+                update={"status": "privacy_blocked", "error_code": "LLM_PRIVACY_BLOCKED"}
+            )
         if monotonic() < self.retry_at:
             return fallback.model_copy(
                 update={
@@ -291,6 +298,11 @@ class RagLLM:
             )
 
     async def _request(self, provider, key, payload):
+        private = prepare_llm_payload(self.settings, provider, payload)
+        response = await self._request_impl(provider, key, private.value)
+        return private.restore(response)
+
+    async def _request_impl(self, provider, key, payload):
         model = self.settings.rag_llm_model or self.settings.gemini_model
         schema = response_schema()
         if provider == "gemini":
@@ -344,8 +356,11 @@ class RagLLM:
             raise last_error
         if provider != "openai_compatible":
             raise ValueError("Unsupported RAG LLM provider")
+        system = SYSTEM + "\nJSON 출력 형식:\n" + json.dumps(schema)
         headers = {"Authorization": f"Bearer {key}"} if key else {}
-        async with httpx.AsyncClient(timeout=self.settings.rag_llm_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.settings.rag_llm_timeout_seconds, trust_env=False
+        ) as client:
             response = await client.post(
                 self.settings.rag_llm_base_url.rstrip("/") + "/chat/completions",
                 headers=headers,
@@ -355,7 +370,7 @@ class RagLLM:
                     "messages": [
                         {
                             "role": "system",
-                            "content": SYSTEM + "\nJSON 출력 형식:\n" + json.dumps(schema),
+                            "content": system,
                         },
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],

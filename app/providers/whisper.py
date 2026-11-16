@@ -1,3 +1,5 @@
+import math
+import re
 from pathlib import Path
 from threading import Lock
 
@@ -5,6 +7,15 @@ from app.audio import SAMPLE_RATE, AudioInput
 from app.config import ROOT, Settings
 from app.errors import ServiceError
 from app.schemas import Segment, Transcript
+
+REPETITION = re.compile(
+    r"(?<!\w)(?P<word>[가-힣A-Za-z0-9]+)(?:\s+(?P=word)){11,}(?!\w)"
+    r"|(?P<character>[가-힣A-Za-z])(?P=character){19,}"
+)
+REPETITION_WARNING = (
+    "음성 인식에서 비정상적인 반복을 감지했습니다. "
+    "재인식 후에도 불확실한 반복 부분은 제외했으니 원음으로 확인해 주세요."
+)
 
 
 class WhisperTranscriber:
@@ -73,6 +84,7 @@ class WhisperTranscriber:
         word_cutoff: float | None = None,
         context_samples: int = 0,
         realtime: bool = False,
+        end_cutoff: float | None = None,
     ) -> Transcript:
         import numpy as np
 
@@ -81,9 +93,19 @@ class WhisperTranscriber:
             return Transcript(text="", provider=self.name, duration_seconds=audio.duration_seconds)
         with self._lock:
             model = self._load()
+            warnings, retry_budget = [], [1]
             try:
                 result, info = self._decode(
-                    model, waveform, language, audio.duration_seconds, word_cutoff, realtime
+                    model,
+                    waveform,
+                    language,
+                    min(audio.duration_seconds, end_cutoff)
+                    if end_cutoff is not None
+                    else audio.duration_seconds,
+                    word_cutoff,
+                    realtime,
+                    warnings=warnings,
+                    retry_budget=retry_budget,
                 )
                 context_seconds = context_samples / audio.sample_rate
                 if (
@@ -102,6 +124,8 @@ class WhisperTranscriber:
                             audio.duration_seconds - context_seconds,
                             None,
                             realtime,
+                            warnings=warnings,
+                            retry_budget=retry_budget,
                         )
                         if fresh:
                             info = fresh_info
@@ -125,9 +149,22 @@ class WhisperTranscriber:
             duration_seconds=audio.duration_seconds,
             segments=result,
             provider=f"{self.name}:{Path(self.model_name).name}",
+            warnings=warnings,
         )
 
-    def _decode(self, model, waveform, language, duration, cutoff, realtime=False):
+    def _decode(
+        self,
+        model,
+        waveform,
+        language,
+        duration,
+        cutoff,
+        realtime=False,
+        *,
+        repair=False,
+        warnings=None,
+        retry_budget=None,
+    ):
         segments, info = model.transcribe(
             waveform,
             language=None if language == "auto" else language,
@@ -138,7 +175,13 @@ class WhisperTranscriber:
                 else self.settings.whisper_beam_size
             ),
             best_of=1 if realtime else 5,
-            temperature=0.0 if realtime else (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            temperature=(0.0, 0.2)
+            if repair
+            else (0.0 if realtime else (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)),
+            # Bound runaway decoding without banning ordinary repeated replies.
+            no_repeat_ngram_size=6 if repair else 12,
+            repetition_penalty=1.1 if repair else 1.0,
+            max_new_tokens=min(400, max(96, math.ceil(duration * 24) + 32)),
             # Do not seed symptom words: Whisper can copy them into noisy/short
             # windows even when they were never spoken.
             hotwords=None,
@@ -163,6 +206,28 @@ class WhisperTranscriber:
             clean = self._segment(segment, duration, cutoff)
             if clean is not None:
                 result.append(clean)
+        if any(REPETITION.search(segment.text) for segment in result):
+            if retry_budget and retry_budget[0]:
+                retry_budget[0] -= 1
+                return self._decode(
+                    model,
+                    waveform,
+                    language,
+                    duration,
+                    cutoff,
+                    realtime,
+                    repair=True,
+                    warnings=warnings,
+                    retry_budget=retry_budget,
+                )
+            cleaned = []
+            for segment in result:
+                text = REPETITION.sub("", segment.text).strip()
+                if text:
+                    cleaned.append(segment.model_copy(update={"text": text}))
+            if warnings is not None and REPETITION_WARNING not in warnings:
+                warnings.append(REPETITION_WARNING)
+            result = cleaned
         return result, info
 
     @staticmethod

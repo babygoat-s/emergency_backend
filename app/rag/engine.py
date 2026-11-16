@@ -3,8 +3,9 @@ import logging
 from threading import Lock
 from time import monotonic
 
-from app.rag.enrichment import numbers_supported
-from app.rag.rules import SYMPTOM_PROTOCOLS, binding_for, field_for
+from app.rag.enrichment import numbers_supported, question_text
+from app.rag.question_bank import active_binding, local_question
+from app.rag.rules import SYMPTOM_PROTOCOLS, field_for
 from app.rag.schemas import (
     Observation,
     RagResult,
@@ -19,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 def conditions_met(binding, state):
     for condition in binding["conditions"]:
+        if "any_fields" in condition:
+            if not any(
+                state.fields.get(field, Observation()).status == "confirmed"
+                and state.fields[field].value in condition["values"]
+                for field in condition["any_fields"]
+            ):
+                return False
+            continue
         fact = state.fields.get(condition["field"], Observation())
         if fact.status != "confirmed":
             return False
@@ -126,7 +135,9 @@ class RagEngine:
         for chunk in store.questions:
             if chunk.source.protocol_id not in {"INTRO", *protocols}:
                 continue
-            binding = bindings.get(chunk.source.question_id, binding_for(chunk))
+            binding = active_binding(
+                chunk, store.questions, bindings.get(chunk.source.question_id), state
+            )
             if (
                 binding["review_reasons"]
                 or not conditions_met(binding, state)
@@ -151,7 +162,11 @@ class RagEngine:
         candidates.sort(
             key=lambda item: (
                 item[1]["priority"],
-                0 if item[0].source.protocol_id == "INTRO" else 1,
+                0
+                if item[0].source.protocol_id == "P02" and "P02" in protocols
+                else 1
+                if item[0].source.protocol_id == "INTRO"
+                else 2,
                 protocol_scores.get(item[0].source.protocol_id, 2.0),
                 item[0].source.protocol_id,
                 item[0].order,
@@ -173,7 +188,7 @@ class RagEngine:
             )
             selected.append(
                 Recommendation(
-                    question=chunk.text,
+                    question=local_question(chunk),
                     reason=reason,
                     related_symptom=chunk.protocol_name,
                     priority=binding["priority"],
@@ -237,6 +252,10 @@ class RagEngine:
             review_count=store.manifest["review_items"],
         )
         result._candidates = selected
+        if self.settings.rag_llm_provider == "disabled":
+            result.llm_status = "disabled"
+            result.summary_provider = "disabled"
+            result.urgency.reason = "요약·긴급도 AI를 보류했습니다. 상담원이 직접 판단해 주세요."
         return result
 
     def question_context(self, result):
@@ -248,7 +267,12 @@ class RagEngine:
         for chunk in self.store().questions:
             if chunk.source.protocol_id not in {"INTRO", *result.state.protocol_ids}:
                 continue
-            binding = self.store().bindings.get(chunk.source.question_id, binding_for(chunk))
+            binding = active_binding(
+                chunk,
+                self.store().questions,
+                self.store().bindings.get(chunk.source.question_id),
+                result.state,
+            )
             if binding["field"] not in fields or binding["review_reasons"]:
                 continue
             if not conditions_met(binding, result.state) or answered(chunk, result.state):
@@ -262,6 +286,20 @@ class RagEngine:
         return context, sources
 
     async def refine(self, turns, result, symptoms=()):
+        if self.settings.rag_llm_provider == "disabled":
+            from starlette.concurrency import run_in_threadpool
+
+            if (
+                result.status != "index_unavailable"
+                and not result.requires_immediate_operator_review
+                and result.retrieval.get("mode") != "chroma_semantic_and_metadata"
+            ):
+                return await run_in_threadpool(
+                    self.recommend, turns, symptoms, state=result.state.model_copy(deep=True)
+                )
+            result.llm_status = "disabled"
+            result.summary_provider = "disabled"
+            return result
         deadline = monotonic() + self.settings.rag_llm_timeout_seconds
         from langchain_core.runnables import RunnableLambda
         from langsmith import tracing_context
@@ -343,20 +381,18 @@ class RagEngine:
             for question in refined.questions:
                 key = question.source.question_id
                 draft = drafts.get(key)
-                if (
-                    not draft
-                    or not draft.context.strip()
-                    or key not in candidates
-                    or key not in draft.source_ids
-                ):
+                if not draft or key not in candidates or key not in draft.source_ids:
                     continue
                 ids = list(dict.fromkeys(draft.source_ids))
                 if any(i not in context or context[i]["field"] != question.field for i in ids):
                     continue
                 evidence = conversation + " " + " ".join(context[i]["text"] for i in ids)
-                if not numbers_supported(draft.context + " " + draft.question, evidence):
+                if not numbers_supported(draft.question, evidence):
                     continue
-                question.question = draft.context.strip() + " " + draft.question.strip()
+                text = question_text(draft.question)
+                if not text:
+                    continue
+                question.question = text
                 # Keep the source/state-based local rationale. The model may
                 # paraphrase a question, but cannot add medical causal claims.
                 question.supporting_sources = [sources[i] for i in ids if i != key]

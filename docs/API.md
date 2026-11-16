@@ -13,6 +13,14 @@
 
 RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니다. `RAG_ENABLED=true`에서 파일·실시간 응답은 `rag`에 원문 질문·상태·근거를 포함합니다. `manual_grounded`는 실제 근거 질문이 있을 때 true이며, `analysis.recommended_questions`도 같은 근거에 연결된 LLM 질문을 사용합니다. 근거가 부족하면 질문 목록이 비어 있을 수 있습니다. RAG의 긴급·응급·비응급은 오래된 원문의 연구용 참고 분류이며 의료 전문가 검증이 필요합니다.
 
+## 현재 개인정보·AI 설정
+
+현재는 `RAG_LLM_PROVIDER=disabled`이며 요약·긴급도 AI를 보류한다. 파일/실시간의 `status=completed`, `analysis=null`은 오류가 아니고 로컬 전사·증상·`rag.questions` 및 `local_questions`가 결과다. `rag.summary=null`, `summary_provider=disabled`, `llm_status=disabled`, `urgency.origin=unavailable`이며 긴급도 단계를 부여하지 않는다. 이후 문서의 LLM 응답 JSON은 선택적 활성화 구성의 호환 예시다.
+
+설정 응답에는 `llm_privacy_mode`, `llm_local_configured`, `llm_external_enabled`, `llm_features_enabled`를 추가했다. 이 정보가 없는 구버전 서버에는 프런트엔드가 고정 예시 외 입력을 보내지 않는다. `llm_local_configured`는 설정 유무이며 모델 품질·가용성 보장이 아니다.
+
+`Transcript.revision`은 원음 정정 세대 번호다. `Segment.recognition_status`는 `recognized`, `needs_review`, `rechecked` 중 하나다. 의심 구간은 임의의 환자 상태로 사용하지 않는다. 종료 시 `{"type":"reviewing","range":{"start":48,"end":66}}` 이벤트 후 정정된 누적 전사를 더 높은 순번의 `audio` update로 보내고 증상·질문을 다시 계산한다. 기존 전사 세대의 늦은 결과는 화면에서 무시한다. `processing_lag_seconds`는 입력 대비 처리 대기량이며 모델 실행 시간 자체가 아니다. 상세 시험·한계는 [안정화 기록](PRIVACY_STABILITY.md)을 참고한다.
+
 ## 녹음 파일 전체 분석 — POST /api/v1/analysis/file
 
 ### Request body
@@ -135,6 +143,8 @@ RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니�
 | `requires_operator_review` | `true` |
 | `warnings` | string 배열 |
 
+`transcript.warnings`는 전사 품질 경고 배열이며 기본값은 `[]`입니다. 비정상 반복을 한 번 재인식한 뒤에도 긴 반복이 남으면 해당 반복 부분을 제외하고 경고를 반환합니다. 이 경고는 응답의 `warnings`에도 포함되며 실시간 세션 후속 업데이트에서도 유지됩니다.
+
 실패: 해당 HTTP 상태와 아래 공통 객체를 반환합니다. `code`는 프로그램 처리용이며 사용자 화면에 직접 표시하지 않습니다.
 
 ```json
@@ -186,6 +196,7 @@ JSON text 메시지:
 | --- | --- |
 | 준비 | `type="ready"`, `encoding="pcm_s16le"`, `sample_rate=16000`, `channels=1`, `window_seconds=number` (전사 구간의 최대 길이), `max_frame_bytes=32000` |
 | 음성 처리 결과 | `type="update"`, `stage="audio"`, `sequence=integer`, `window={start:number,end:number}`, `data=AnalysisResponse` |
+| 먼저 표시할 전사 | `type="update"`, `stage="transcript"`, 이어지는 `audio`와 같은 `sequence` 및 `window`. 화자 분류나 매뉴얼 검색이 진행 중일 때 Whisper의 누적 전사를 먼저 반환. `audio`가 같은 발화의 화자와 질문을 갱신함 |
 | 로컬 증상 결과 | `type="update"`, `stage="symptoms"`, 같은 `sequence`와 `window`, `data.symptom_provider`가 분류기를 식별하며 `data.symptoms`가 비어 있을 수 있음. 분류 실패 시 `error` 필드를 포함하며 상황 분석은 계속됨 |
 | 상황 분석 결과 | `type="update"`, `stage="analysis"`, `sequence=integer`, `window={start:number,end:number}`, `data=AnalysisResponse`; 실패 시 `error={code:string,message:string}` 추가 |
 | 정상 종료 | `type="finished"`, `windows_processed=integer`, `duration_seconds=number` |

@@ -62,7 +62,7 @@ def engine():
         order=0,
         text="의식이 없거나/불확실한 경우, 호흡이 없거나/불확실한 경우에는 원문 위험 조건 검토",
     )
-    result = RagEngine(Settings(_env_file=None, rag_llm_provider="disabled"))
+    result = RagEngine(Settings(_env_file=None, rag_llm_provider="gemini"))
     result._store = SimpleNamespace(
         questions=questions,
         chunks=[*questions, procedure],
@@ -98,6 +98,8 @@ def test_confirmed_fields_are_not_repeated_and_negation_is_clause_scoped(engine)
 
 
 def test_urgent_report_returns_source_alert_without_waiting_for_llm(engine):
+    engine.settings.rag_llm_provider = "disabled"
+
     def forbidden_search(*args, **kwargs):
         raise AssertionError("Urgent source alerts must precede embedding work")
 
@@ -278,6 +280,8 @@ def test_audio_pipeline_uses_rag_questions_in_final_response(backend, engine):
 
     backend.service.rag = engine
     backend.service.settings.rag_enabled = True
+    backend.service.settings.rag_llm_provider = "disabled"
+    engine.settings.rag_llm_provider = "disabled"
     result = AnalysisResponse(
         transcript=Transcript(text="머리가 아파요.", provider="fixture"),
         analysis_provider="fixture",
@@ -285,10 +289,10 @@ def test_audio_pipeline_uses_rag_questions_in_final_response(backend, engine):
     completed = asyncio.run(backend.service.complete(result))
     assert backend.analyzer.calls == []
     assert completed.manual_grounded
-    assert completed.analysis.summary != "머리가 아파요."
+    assert completed.analysis is None
     assert completed.rag.summary is None
     assert completed.rag.summary_provider == "disabled"
-    assert [q.question for q in completed.analysis.recommended_questions] == [
+    assert [q.question for q in completed.local_questions] == [
         q.question for q in completed.rag.questions
     ]
 
@@ -309,7 +313,8 @@ def test_realtime_audio_event_already_contains_source_questions(backend, engine)
             pass
 
 
-def test_llm_rewrites_with_matching_sources_and_preserves_raw_excerpt(engine):
+@pytest.mark.parametrize("preamble", ["", "두통을 호소하는 환자분을 돕고 계신 상황입니다."])
+def test_llm_rewrites_with_matching_sources_and_preserves_raw_excerpt(engine, preamble):
     turns = [caller("머리가 아파요.")]
     original = engine.recommend(turns, semantic=False)
     primary = original.questions[0]
@@ -330,7 +335,7 @@ def test_llm_rewrites_with_matching_sources_and_preserves_raw_excerpt(engine):
             questions=[
                 QuestionDraft(
                     candidate_id=primary.source.question_id,
-                    context="두통을 호소하는 환자분을 돕고 계신 상황입니다.",
+                    context=preamble,
                     question="두통이 있는 환자분을 돕고 계신 지금 신고자분은 안전한가요?",
                     reason="신고자의 안전이 아직 확인되지 않았습니다.",
                     source_ids=[primary.source.question_id, extra.id],
@@ -342,6 +347,7 @@ def test_llm_rewrites_with_matching_sources_and_preserves_raw_excerpt(engine):
     result = asyncio.run(engine.refine(turns, original))
     rewritten = result.questions[0]
     assert rewritten.selection_origin == "llm_rewrite"
+    assert rewritten.question == "두통이 있는 환자분을 돕고 계신 지금 신고자분은 안전한가요?"
     assert rewritten.question != primary.question
     assert rewritten.source_excerpt == primary.source_excerpt
     assert rewritten.source == primary.source
@@ -592,4 +598,5 @@ def test_remaining_raw_questions_get_one_bounded_rewrite_without_losing_summary(
     assert requests == ["analyze_consultation", "rewrite_questions_only"]
     assert result.summary == "환자가 두통을 호소합니다."
     assert all(q.selection_origin == "llm_rewrite" for q in result.questions)
-    assert all(q.question.startswith("두통을 호소하는") for q in result.questions)
+    assert all(not q.question.startswith("두통을 호소하는") for q in result.questions)
+    assert all("상황입니다." not in q.question for q in result.questions)

@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.errors import ServiceError
+from app.privacy import prepare_llm_payload, require_llm_destination
 from app.schemas import SYMPTOM_LABELS, Situation, Symptom
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,7 @@ class GeminiAnalyzer:
         return max(self._retry_at - monotonic(), 1.0 if self._probe_in_flight else 0.0)
 
     async def analyze(self, text: str, symptoms: list[Symptom] | None) -> Situation:
+        require_llm_destination(self.settings, "gemini")
         if not self.settings.gemini_api_key.get_secret_value().strip():
             raise ServiceError(503, "GEMINI_NOT_CONFIGURED", ".env에 GEMINI_API_KEY를 입력하세요.")
         recovering = self._retry_delay > 0
@@ -237,14 +239,16 @@ class GeminiAnalyzer:
                     retry_options=types.HttpRetryOptions(attempts=1),
                 ),
             )
-        payload = json.dumps(
+        private = prepare_llm_payload(
+            self.settings,
+            "gemini",
             {
                 "transcript": text,
                 "symptom_categories": SYMPTOM_LABELS if symptoms is None else None,
                 "local_symptoms": None if symptoms is None else [s.model_dump() for s in symptoms],
             },
-            ensure_ascii=False,
         )
+        payload = json.dumps(private.value, ensure_ascii=False)
         if recovering:
             self._probe_in_flight = True
         try:
@@ -263,7 +267,7 @@ class GeminiAnalyzer:
             )
             if recovering:
                 self._retry_delay = 0
-            result = Situation.model_validate_json(response.text or "")
+            result = Situation.model_validate_json(private.restore(response.text or "{}"))
             if not result.recommended_questions:
                 raise ValueError("Legacy analysis requires at least one question")
         except TIMEOUT_ERRORS as exc:

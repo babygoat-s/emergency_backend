@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from importlib import import_module
 
@@ -21,6 +22,7 @@ from app.providers.gemini import GeminiAnalyzer
 from app.providers.whisper import WhisperTranscriber
 from app.rag.engine import RagEngine
 from app.rag.schemas import Turn
+from app.recognition_quality import trusted_text
 from app.schemas import (
     AnalysisResponse,
     Question,
@@ -131,6 +133,7 @@ class AnalysisService:
         realtime: bool = False,
         stt_context: bytes = b"",
         committed_end: float = 0.0,
+        on_transcript: Callable[[AnalysisResponse], Awaitable[None]] | None = None,
     ) -> AnalysisResponse:
         transcriber = self.realtime_transcriber if realtime else self.transcriber
         context_seconds = 0.0
@@ -153,10 +156,34 @@ class AnalysisService:
                 )
             else:
                 stt = run_in_threadpool(transcriber.transcribe, audio, language)
-            transcript, spans = await asyncio.gather(
-                stt,
-                run_in_threadpool(self.diarizer.diarize, audio, speaker_state),
+            diarization = asyncio.create_task(
+                run_in_threadpool(self.diarizer.diarize, audio, speaker_state)
             )
+            try:
+                transcript = await stt
+                if (
+                    on_transcript is not None
+                    and not isinstance(self.diarizer, SpeakerModel)
+                    and not diarization.done()
+                    and transcript.text
+                ):
+                    await on_transcript(
+                        self._audio_result(
+                            transcript.model_copy(),
+                            None,
+                            audio,
+                            context_seconds,
+                            pending_speakers=True,
+                        )
+                    )
+                spans = await diarization
+            finally:
+                if not diarization.done():
+                    diarization.cancel()
+                await asyncio.gather(diarization, return_exceptions=True)
+        return self._audio_result(transcript, spans, audio, context_seconds)
+
+    def _audio_result(self, transcript, spans, audio, context_seconds, *, pending_speakers=False):
         transcript = Transcript.model_validate(transcript)
         # Measured duration includes silence, preventing timestamp drift.
         transcript.duration_seconds = audio.duration_seconds
@@ -179,7 +206,8 @@ class AnalysisService:
             if not context_seconds:
                 assign_speaker(segment, speakers.segments, speakers.available)
         warnings = [WARNINGS[0]] if self.settings.rag_enabled else list(WARNINGS)
-        if not speakers.available:
+        warnings.extend(transcript.warnings)
+        if not speakers.available and not pending_speakers:
             warnings.append("화자 분류 결과를 사용할 수 없어 화자는 unknown으로 표시합니다.")
         return AnalysisResponse(
             status="pending" if transcript.text else "no_speech",
@@ -190,9 +218,10 @@ class AnalysisService:
         )
 
     async def classify(self, result: AnalysisResponse) -> AnalysisResponse:
-        if result.transcript.text:
+        text = trusted_text(result.transcript)
+        if text:
             async with self.slot(self._classifier_slots):
-                symptoms = await run_in_threadpool(self.classifier.predict, result.transcript.text)
+                symptoms = await run_in_threadpool(self.classifier.predict, text)
             if symptoms is not None:
                 result.symptoms = symptoms
                 result.symptom_provider = self.classifier.name
@@ -200,11 +229,23 @@ class AnalysisService:
             await self.prepare_rag(result, semantic=False)
         return result
 
+    async def recheck_audio(self, audio, language, *, word_cutoff, end_cutoff):
+        model = self.settings.whisper_repair_model or self.settings.whisper_model
+        reviewer = WhisperTranscriber(self.settings, model)
+        async with self.slot():
+            return await run_in_threadpool(
+                reviewer.transcribe, audio, language, word_cutoff=word_cutoff, end_cutoff=end_cutoff
+            )
+
     @staticmethod
     def conversation(result):
         segments = result.transcript.segments
         if segments:
-            return [Turn(id=str(i), speaker=s.speaker, text=s.text) for i, s in enumerate(segments)]
+            return [
+                Turn(id=str(i), speaker=s.speaker, text=s.text)
+                for i, s in enumerate(segments)
+                if s.recognition_status != "needs_review"
+            ]
         return [Turn(id="0", text=result.transcript.text)] if result.transcript.text else []
 
     async def prepare_rag(self, result, *, semantic=True):
@@ -220,19 +261,35 @@ class AnalysisService:
         ]
         return result
 
-    async def complete(self, result: AnalysisResponse) -> AnalysisResponse:
+    async def complete(
+        self, result: AnalysisResponse, *, semantic: bool = True
+    ) -> AnalysisResponse:
+        if not self.settings.rag_enabled and (
+            self.settings.rag_llm_provider == "disabled"
+            or self.settings.llm_privacy_mode == "local_only"
+        ):
+            result.status = "completed"
+            result.analysis = None
+            result.analysis_provider = "local"
+            return result
         if self.settings.rag_enabled:
             result = result.model_copy(deep=True)
             if result.rag is None:
-                await self.prepare_rag(result)
+                await self.prepare_rag(result, semantic=semantic)
             if result.rag is not None:
-                result.rag = await self.rag.refine(
-                    self.conversation(result), result.rag, result.symptoms
-                )
+                if semantic or self.settings.rag_llm_provider != "disabled":
+                    result.rag = await self.rag.refine(
+                        self.conversation(result), result.rag, result.symptoms
+                    )
                 result.manual_grounded = bool(result.rag.questions)
                 result.local_questions = [
                     Question(question=q.question, purpose=q.reason) for q in result.rag.questions
                 ]
+                if self.settings.rag_llm_provider == "disabled":
+                    result.status = "completed"
+                    result.analysis = None
+                    result.analysis_provider = "manual-rag"
+                    return result
                 result.analysis = Situation(
                     summary=result.rag.summary or "LLM 요약을 아직 생성하지 못했습니다.",
                     symptoms=result.symptoms,

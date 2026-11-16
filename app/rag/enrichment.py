@@ -42,6 +42,16 @@ class Enrichment(RagModel):
     model: str | None = None
 
 
+def question_text(text: str) -> str:
+    """Keep read-aloud questions; older model outputs can include a preamble."""
+    sentences = re.split(r"(?<=[.!?。！？])(?!\d)\s*|\n+", text.strip())
+    return " ".join(
+        sentence.strip()
+        for sentence in sentences
+        if re.search(r"[?？]|(?:나요|습니까|인가요|까요|인지요)[.。]?$", sentence.strip())
+    )
+
+
 def numbers_supported(text: str, evidence: str) -> bool:
     def values(value):
         # 119 in a service name is not a newly asserted patient measurement.

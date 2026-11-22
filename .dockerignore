@@ -1,0 +1,27 @@
+**
+!pyproject.toml
+!app/**
+!models/정리모델_3개.pt
+!models/Speaker Diarization.pth
+!models/tokenizer/*.json
+!models/tokenizer/vocab.txt
+!models/rag_embedding/*.json
+!models/rag_embedding/model.safetensors
+!models/rag_embedding/sentencepiece.bpe.model
+!models/rag_embedding/1_Pooling/config.json
+!models/whisper-turbo/*.json
+!models/whisper-turbo/model.bin
+!data/rag/current.json
+!data/rag/releases/*/manifest.json
+!data/rag/releases/*/bindings.json
+!data/rag/releases/*/chunks.json
+!data/rag/releases/*/sources/manual.pdf
+!data/rag/releases/*/sources/sop501.pdf
+!data/rag/releases/*/chroma/chroma.sqlite3
+!data/rag/releases/*/chroma/*/header.bin
+!data/rag/releases/*/chroma/*/data_level0.bin
+!data/rag/releases/*/chroma/*/length.bin
+!data/rag/releases/*/chroma/*/link_lists.bin
+!data/rag/releases/*/chroma/*/index_metadata.pickle
+**/__pycache__
+**/.env*

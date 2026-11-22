@@ -29,6 +29,8 @@ KoELECTRA의 분류 대상은 **고열, 구토·오심, 두통, 복통, 어지�
 
 ## 실행
 
+Google Cloud에 배포하려면 [Cloud Run 배포 안내](docs/CLOUD_RUN.md)를 참고하세요.
+
 PDF 인덱싱·환경변수·텍스트 대화 API·추출 JSON·검토 목록은 [RAG 설치 및 데이터 구조](docs/RAG.md)를 참고하세요. 음성 경로와 텍스트 입력 화면에서 같은 원문 질문 추천을 사용합니다.
 
 Python 3.10 이상을 사용합니다. 프로젝트 가상환경의 Python을 사용하세요.

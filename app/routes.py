@@ -8,6 +8,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import FileResponse
 from starlette.websockets import WebSocketDisconnect
 
+from app.auth import REALTIME_PROTOCOL
 from app.errors import ServiceError
 from app.examples import example_analysis
 from app.models.koelectra import LABEL_CODES
@@ -86,6 +87,13 @@ async def config(service: Service):
     }
 
 
+@router.get("/auth/session", include_in_schema=False)
+async def auth_session(service: Service):
+    if not service.settings.google_auth_required:
+        raise ServiceError(503, "AUTH_UNAVAILABLE", "서버에서 Google 인증을 설정해 주세요.")
+    return {"status": "ok"}
+
+
 @router.get("/analysis/example", response_model=AnalysisResponse, summary="고정 분석 예시")
 async def example():
     return example_analysis()
@@ -148,7 +156,7 @@ async def realtime(websocket: WebSocket):
     if origin is not None and origin not in settings.cors_origins:
         await websocket.close(code=1008)
         return
-    await websocket.accept()
+    await websocket.accept(subprotocol=REALTIME_PROTOCOL if settings.google_auth_required else None)
     try:
         raw = await asyncio.wait_for(
             websocket.receive_text(), timeout=settings.ws_idle_timeout_seconds

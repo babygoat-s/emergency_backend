@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.exceptions import HTTPException
 
+from app.auth import GoogleAuthMiddleware
 from app.config import Settings
 from app.errors import ServiceError
 from app.middleware import BodyLimitMiddleware, RequestTooLarge
@@ -104,12 +105,19 @@ def create_app(settings: Settings | None = None, service: AnalysisService | None
     application.add_middleware(
         BodyLimitMiddleware, max_bytes=settings.max_upload_bytes + 1024 * 1024
     )
+    if settings.google_auth_required:
+        application.add_middleware(
+            GoogleAuthMiddleware,
+            client_id=settings.google_oauth_client_id,
+            allowed_emails=settings.google_allowed_emails,
+            access=settings.google_auth_access,
+        )
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "Authorization"],
     )
     return application
 

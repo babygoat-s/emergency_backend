@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.schemas import Speaker
@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.5-flash-lite"
     gemini_timeout_seconds: float = Field(default=45, gt=0, le=300)
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    google_auth_required: bool = False
+    google_oauth_client_id: str = ""
+    google_auth_access: Literal["allowlist", "verified_google_accounts"] = "allowlist"
+    google_allowed_emails: list[str] = Field(default_factory=list)
     max_upload_mb: int = Field(default=50, ge=1, le=100)
     max_audio_seconds: float = Field(default=600, gt=0, le=3600)
     max_concurrent_inferences: int = Field(default=2, ge=1, le=16)
@@ -62,6 +66,21 @@ class Settings(BaseSettings):
     realtime_adaptive_batch: bool = True
     realtime_batch_seconds: float = Field(default=18, ge=6, le=24)
     realtime_review_enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_google_auth(self):
+        if self.google_auth_required:
+            if not self.google_oauth_client_id.endswith(".apps.googleusercontent.com"):
+                raise ValueError("GOOGLE_OAUTH_CLIENT_ID must be a Google web client ID")
+            if self.google_auth_access == "allowlist":
+                if not self.google_allowed_emails or any(
+                    "@" not in email or email != email.strip()
+                    for email in self.google_allowed_emails
+                ):
+                    raise ValueError(
+                        "GOOGLE_ALLOWED_EMAILS must contain the allowed Google accounts"
+                    )
+        return self
 
     @property
     def max_upload_bytes(self) -> int:

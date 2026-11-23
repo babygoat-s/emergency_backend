@@ -75,4 +75,20 @@ $env:API_PROXY_TARGET = 'http://127.0.0.1:8080'
 npm run dev -- --host 127.0.0.1
 ```
 
-브라우저에서 `http://127.0.0.1:5173`을 열면 로컬 프런트엔드가 Cloud Run 백엔드로 요청한다. 이 방식은 개발자 테스트에 사용한다. 배포된 웹사이트에서 여러 사용자에게 제공하려면 로그인된 사용자의 요청을 검증하고 인증된 Cloud Run 호출을 수행하는 같은 출처의 `/api` 게이트웨이가 필요하다. 서비스 계정 키와 ID 토큰은 브라우저 코드에 넣지 않는다. [서비스 간 인증](https://docs.cloud.google.com/run/docs/authenticating/service-to-service)
+브라우저에서 `http://127.0.0.1:5173`을 열면 로컬 프런트엔드가 Cloud Run 백엔드로 요청한다. 이 방식은 개발자 테스트에 사용한다. IAM 전용 서비스와 배포된 웹사이트를 연결하는 경우에는 HTTP와 WebSocket에 서버 측 인증을 붙이는 게이트웨이를 사용할 수 있다. 서비스 계정 키는 브라우저 코드에 넣지 않는다. [서비스 간 인증](https://docs.cloud.google.com/run/docs/authenticating/service-to-service)
+
+## 4. Vercel에서 Cloud Run에 직접 연결
+
+1. Google Auth Platform에서 웹 애플리케이션 유형의 OAuth 클라이언트를 만든다. 실제 Vercel HTTPS 주소를 **승인된 자바스크립트 원본**에 등록한다. 로컬에서 먼저 시험할 경우 `http://localhost:5173` 및 `http://127.0.0.1:5173`도 등록한다. 동의 화면이 테스트 상태라면 사용할 Google 계정을 테스트 사용자에 추가한다. [Google 로그인 클라이언트 설정](https://developers.google.com/identity/gsi/web/guides/get-google-api-clientid)
+2. 아래 환경변수로 새 백엔드 이미지를 배포하고 Cloud Run의 호출자 IAM 검사를 유지한 상태에서 확인한다. 모든 확인된 Google 계정을 허용하려면 `verified_google_accounts`를 지정한다. `allowlist` 모드에서는 목록에 Gmail이나 Google이 관리하는 Workspace 계정의 이메일을 적는다.
+
+| Cloud Run 환경변수 | 값 예시 |
+| --- | --- |
+| `GOOGLE_AUTH_REQUIRED` | `true` |
+| `GOOGLE_OAUTH_CLIENT_ID` | `123456789-example.apps.googleusercontent.com` |
+| `GOOGLE_AUTH_ACCESS` | `verified_google_accounts` 또는 `allowlist` |
+| `GOOGLE_ALLOWED_EMAILS` | `allowlist` 모드 전용. 예: `["tester@gmail.com"]` |
+| `CORS_ORIGINS` | `["https://your-project.vercel.app","http://localhost:5173","http://127.0.0.1:5173"]` |
+
+3. Vercel 프런트엔드 프로젝트의 `GOOGLE_CLIENT_ID`를 동일하게 지정하고 `BE_API_BASE_URL`에는 Cloud Run 서비스의 HTTPS origin을 넣는다. `VITE_API_BASE_URL`도 설정했다면 그 값이 우선한다. WebSocket과 파일 업로드는 브라우저에서 Cloud Run에 직접 연결한다.
+4. 비공개 서비스의 로컬 인증 프록시로 로그인과 파일·WebSocket을 먼저 시험한다. 이때 로컬 프런트엔드는 `VITE_API_BASE_URL`을 비우고 `API_PROXY_TARGET=http://127.0.0.1:8080`을 사용한다. 앱 인증 없는 요청이 거부되는지 확인한 뒤 Cloud Run 콘솔에서 호출자 IAM 검사를 해제하고 Vercel 배포에서도 다시 확인한다. FastAPI는 HTTP와 WebSocket 모두에서 Google 토큰과 접근 설정을 검증한다. [Cloud Run 사용자 인증](https://docs.cloud.google.com/run/docs/authenticating/end-users)

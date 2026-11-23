@@ -1,7 +1,9 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from app.audio import BYTES_PER_SECOND, AudioInput
@@ -11,7 +13,7 @@ from app.privacy import is_loopback_endpoint, prepare_llm_payload, require_llm_d
 from app.providers.whisper import WhisperTranscriber
 from app.rag.engine import RagEngine, conditions_met
 from app.rag.llm import RagLLM
-from app.rag.schemas import ConsultationState, Observation, Turn
+from app.rag.schemas import ConsultationState, Observation, RagResult, Turn
 from app.realtime import RealtimeSession
 from app.recognition_quality import REVIEW_FAILED, suspicious_reply_runs, trusted_text
 from app.schemas import AnalysisResponse, Segment, StreamStart, Transcript
@@ -91,9 +93,56 @@ def test_cloud_identifier_redaction_and_local_restore_preserve_clinical_numbers(
     for identifier in ["홍길동", "010-1234-5678", "sample@example.org"]:
         assert identifier not in outgoing
     assert "60세, 10분 전 마비" in outgoing
-    import json
-
     assert json.loads(private.restore(json.dumps({"quote": outgoing}))) == {"quote": text}
+
+
+def test_local_llm_receives_original_turn_and_returns_grounded_analysis(monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        rag_llm_provider="openai_compatible",
+        rag_llm_model="qwen3.5:4b",
+        rag_llm_reasoning_effort="none",
+        rag_llm_compact_request=True,
+        llm_privacy_mode="local_only",
+    )
+    turn = Turn(id="caller-1", speaker="caller", text="이름은 테스트입니다. 숨쉬기 힘들어요.")
+    summary = "신고자가 호흡이 어렵다고 보고했습니다."
+
+    def respond(request):
+        assert str(request.url) == "http://127.0.0.1:11434/v1/chat/completions"
+        request_body = json.loads(request.content)
+        assert request_body["model"] == "qwen3.5:4b"
+        assert request_body["reasoning_effort"] == "none"
+        assert request_body["response_format"]["type"] == "json_schema"
+        schema = request_body["response_format"]["json_schema"]["schema"]["properties"]
+        assert set(schema) == {"summary", "summary_turn"}
+        assert "urgency" not in request_body["messages"][0]["content"]
+        assert schema["summary_turn"]["enum"] == [turn.id]
+        assert json.loads(request_body["messages"][1]["content"])["conversation"] == [
+            [turn.id, turn.speaker, turn.text]
+        ]
+        content = {
+            "summary": summary,
+            "summary_turn": turn.id,
+            "urgency": "high",
+        }
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(content)}}]}
+        )
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "app.rag.llm.httpx.AsyncClient",
+        lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    result = RagResult(status="ready", state=ConsultationState(), message="")
+    enriched = asyncio.run(RagLLM(settings).enrich([turn], result))
+    assert enriched.status == "completed"
+    assert enriched.model == "qwen3.5:4b"
+    assert enriched.summary == summary
+    assert enriched.urgency.level == "unknown"
+    assert enriched.urgency.origin == "unavailable"
+    assert not enriched.urgency.evidence
 
 
 def segments():

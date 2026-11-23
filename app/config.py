@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     symptom_tokenizer_path: str = ""
     realtime_window_seconds: float = Field(default=6, ge=0.5, le=10)
     realtime_pause_split: bool = False
-    realtime_analysis_timeout_seconds: float = Field(default=25, gt=0, le=60)
+    realtime_analysis_timeout_seconds: float = Field(default=25, gt=0, le=120)
     realtime_analysis_min_interval_seconds: float = Field(default=10, ge=0, le=60)
     realtime_queue_windows: int = Field(default=4, ge=1, le=20)
     ws_idle_timeout_seconds: float = Field(default=120, gt=0, le=3600)
@@ -56,7 +56,9 @@ class Settings(BaseSettings):
     rag_llm_model: str = ""
     rag_llm_api_key: SecretStr = SecretStr("")
     rag_llm_base_url: str = "http://127.0.0.1:11434/v1"
-    rag_llm_timeout_seconds: float = Field(default=20, gt=0, le=60)
+    rag_llm_reasoning_effort: Literal["", "none"] = ""
+    rag_llm_compact_request: bool = False
+    rag_llm_timeout_seconds: float = Field(default=20, gt=0, le=120)
     rag_llm_attempt_timeout_seconds: float = Field(default=10, gt=0, le=60)
     rag_llm_max_retries: int = Field(default=1, ge=0, le=2)
     rag_llm_fallback_models: list[str] = ["gemini-3.1-flash-lite"]

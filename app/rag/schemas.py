@@ -77,6 +77,10 @@ class UrgencyProposal(RagModel):
     evidence: list[Quote] = Field(default_factory=list, max_length=10)
     origin: Literal["llm", "unavailable"] = "unavailable"
 
+    @classmethod
+    def operator_review(cls):
+        return cls(reason="긴급도는 상담원이 직접 판단합니다.")
+
 
 class Recommendation(RagModel):
     question: str

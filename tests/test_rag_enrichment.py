@@ -276,3 +276,4 @@ def test_application_timeout_stays_bounded_independent_of_provider_deadline():
     enriched = asyncio.run(llm.enrich([Turn(id="0", text="가상 증상")], original))
     assert enriched.status == "unavailable"
     assert enriched.error_code == "TIMEOUT"
+    assert enriched.retry_after_seconds == 0

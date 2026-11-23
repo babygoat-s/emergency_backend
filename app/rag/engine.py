@@ -11,6 +11,7 @@ from app.rag.schemas import (
     RagResult,
     Recommendation,
     Reference,
+    UrgencyProposal,
 )
 from app.rag.state import update_state
 from app.rag.store import ManualStore
@@ -68,12 +69,19 @@ class RagEngine:
         self.store()._load()
 
     def recommend(self, turns, symptoms=(), previous=None, *, semantic=True, state=None):
+        urgency = UrgencyProposal()
+        if (
+            self.settings.rag_llm_provider == "openai_compatible"
+            and self.settings.rag_llm_compact_request
+        ):
+            urgency = UrgencyProposal.operator_review()
         try:
             store = self.store()
         except (OSError, ValueError, ImportError, KeyError):
             return RagResult(
                 status="index_unavailable",
                 state=update_state(turns, [], previous),
+                urgency=urgency,
                 message=(
                     "매뉴얼 인덱스를 사용할 수 없습니다. PDF 인덱싱을 완료하고 서버를 재시작하세요."
                 ),
@@ -247,6 +255,7 @@ class RagEngine:
             classification_references=classifications,
             instruction_references=instructions,
             requires_immediate_operator_review=urgent,
+            urgency=urgency,
             message=message,
             retrieval=retrieval,
             review_count=store.manifest["review_items"],
@@ -301,8 +310,6 @@ class RagEngine:
             result.summary_provider = "disabled"
             return result
         deadline = monotonic() + self.settings.rag_llm_timeout_seconds
-        from langchain_core.runnables import RunnableLambda
-        from langsmith import tracing_context
         from starlette.concurrency import run_in_threadpool
 
         from app.rag.llm import RagLLM
@@ -310,35 +317,17 @@ class RagEngine:
         if self._llm is None:
             self._llm = RagLLM(self.settings)
 
-        async def retrieve(_):
-            if result.status == "index_unavailable":
-                return {"result": result, "context": {}, "sources": {}}
-            current = result
+        context, sources = {}, {}
+        if result.status != "index_unavailable":
             if (
                 not result.requires_immediate_operator_review
                 and result.retrieval.get("mode") != "chroma_semantic_and_metadata"
             ):
-                current = await run_in_threadpool(
+                result = await run_in_threadpool(
                     self.recommend, turns, symptoms, state=result.state.model_copy(deep=True)
                 )
-            context, sources = self.question_context(current)
-            return {"result": current, "context": context, "sources": sources}
-
-        async def generate(data):
-            data["enriched"] = await self._llm.enrich(turns, data["result"], data["context"])
-            return data
-
-        pipeline = RunnableLambda(retrieve, name="retrieve_protocols_from_chroma") | RunnableLambda(
-            generate, name="generate_grounded_consultation"
-        )
-        with tracing_context(enabled=False):
-            prepared = await pipeline.ainvoke({}, config={"callbacks": []})
-        result, context, sources, enriched = (
-            prepared["result"],
-            prepared["context"],
-            prepared["sources"],
-            prepared["enriched"],
-        )
+            context, sources = self.question_context(result)
+        enriched = await self._llm.enrich(turns, result, context)
         refined = (
             result.model_copy(deep=True)
             if result.status == "index_unavailable"
@@ -402,7 +391,13 @@ class RagEngine:
         missing = [q for q in refined.questions if q.selection_origin != "llm_rewrite"]
         rewrite = getattr(self._llm, "rewrite_missing", None)
         remaining = deadline - monotonic()
-        if missing and enriched.status == "completed" and rewrite and remaining > 1:
+        if (
+            missing
+            and enriched.status == "completed"
+            and rewrite
+            and remaining > 1
+            and not self.settings.rag_llm_compact_request
+        ):
             repair_context, repair_sources = self.question_context(refined)
             try:
                 repaired = await asyncio.wait_for(

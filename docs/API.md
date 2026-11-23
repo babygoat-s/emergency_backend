@@ -15,7 +15,7 @@ RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니�
 
 ## 현재 개인정보·AI 설정
 
-현재는 `RAG_LLM_PROVIDER=disabled`이며 요약·긴급도 AI를 보류한다. 파일/실시간의 `status=completed`, `analysis=null`은 오류가 아니고 로컬 전사·증상·`rag.questions` 및 `local_questions`가 결과다. `rag.summary=null`, `summary_provider=disabled`, `llm_status=disabled`, `urgency.origin=unavailable`이며 긴급도 단계를 부여하지 않는다. 이후 문서의 LLM 응답 JSON은 선택적 활성화 구성의 호환 예시다.
+기본 실행 환경은 로컬 Ollama를 사용한다. 모델 호출에 실패하면 전사·증상·매뉴얼 질문을 계속 반환한다. `RAG_LLM_PROVIDER=disabled`를 설정한 경우 파일/실시간 응답의 `analysis`는 null이며 `rag.summary_provider`와 `rag.llm_status`는 disabled다.
 
 설정 응답에는 `llm_privacy_mode`, `llm_local_configured`, `llm_external_enabled`, `llm_features_enabled`를 추가했다. 이 정보가 없는 구버전 서버에는 프런트엔드가 고정 예시 외 입력을 보내지 않는다. `llm_local_configured`는 설정 유무이며 모델 품질·가용성 보장이 아니다.
 
@@ -313,6 +313,6 @@ JSON text 메시지:
 `gemini_configured`는 키 입력 여부를 나타내는 boolean이며, 실제 모델 실행이나 외부 API 호출 성공 여부를 나타내지는 않습니다.
 
 
-RAG LLM은 LangChain으로 연결합니다. `rag.summary`는 LLM 종합 요약이며 실패 시 null이고 발화를 대신 넣지 않습니다. `rag.summary_provider`는 llm/pending/unavailable/disabled입니다. `rag.urgency`는 level/reason/evidence/origin으로 검토용 5단계 제안과 발화 근거를 제공합니다. 음성 응답의 `analysis.urgency`도 이 제안을 사용합니다. `rag.retry_after_seconds`는 재시도 대기 시간, `rag.llm_model`은 성공한 모델입니다. 실시간 update의 `processing_lag_seconds`는 아직 전사하지 못한 입력 길이입니다. 이는 연결 종료 오류가 아닙니다.
+기본 로컬 LLM은 `rag.summary`의 요약과 매뉴얼 질문 문구를 생성합니다. 요약 실패 시 `rag.summary`는 null이며 `rag.summary_provider`는 llm/pending/unavailable/disabled 중 하나입니다. `rag.urgency`는 호환을 위해 `level=unknown`, `origin=unavailable`로 반환합니다. 즉시 확인 여부와 경고는 `rag.requires_immediate_operator_review`와 `rag.safety_alerts`에 포함됩니다. `rag.retry_after_seconds`는 재시도 대기 시간, `rag.llm_model`은 응답한 모델입니다. 실시간 update의 `processing_lag_seconds`는 아직 전사하지 못한 입력 길이입니다.
 
 음성 상태 추정 계약은 제거했습니다. 응답과 설정에는 해당 필드가 없습니다. `rag.urgency.origin`은 llm 또는 unavailable이며, llm이 아닌 경우 5단계 결과를 표시하지 않습니다. 유효한 결과를 얻기 전의 분석 대기·미완료와 LLM이 정보 부족으로 반환한 unknown(판단 보류)을 구분합니다.

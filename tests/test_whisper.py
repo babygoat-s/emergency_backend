@@ -1,3 +1,4 @@
+import asyncio
 import io
 import math
 import struct
@@ -10,6 +11,15 @@ from app.audio import AudioInput, decode_upload
 from app.config import Settings
 from app.errors import ServiceError
 from app.providers.whisper import REPETITION_WARNING, WhisperTranscriber
+from app.recognition_quality import REVIEW_WARNING
+from app.services import AnalysisService
+
+VARIED_LOOP = (
+    "이 시그는 이 시그는 이 시그는 이 시그에 이 시그에 이 시그에 이 시그는 이 시그에 "
+    "이 시그에는 이 시그에 이 시그에 이 시그에는 이 시그에는 이 시그에는 이 시그에 "
+    "이 시그에는 이 시그엔 이 시그에는 이 시그에는 이 시그엔 이 시그엔 이 시그엔 "
+    "이 시그에는 이 시그엔 이 시"
+)
 
 
 def wave_bytes(seconds=1, sample_rate=8000, silent=False):
@@ -76,6 +86,51 @@ def test_whisper_receives_normalized_audio_and_reuses_model(monkeypatch):
         assert result.text == "도와주세요"
         assert result.segments[0].end == 1
     assert calls == [1]
+
+
+@pytest.mark.parametrize(
+    ("repair_model", "provider"), [("", "transcriber"), ("base", "realtime_transcriber")]
+)
+def test_review_shares_whisper_when_weights_match(repair_model, provider):
+    service = AnalysisService(
+        Settings(_env_file=None, whisper_realtime_model="base", whisper_repair_model=repair_model)
+    )
+    assert service.reviewer is getattr(service, provider)
+
+
+@pytest.mark.parametrize("review_enabled", [True, False])
+def test_review_loads_model_once_and_reuses_it(monkeypatch, review_enabled):
+    library = pytest.importorskip("faster_whisper")
+    loaded = []
+
+    class Model:
+        def __init__(self, model, **kwargs):
+            loaded.append(model)
+
+        def transcribe(self, waveform, **kwargs):
+            segment = SimpleNamespace(start=0, end=0.8, text="도와주세요", words=[])
+            return iter([segment]), SimpleNamespace(language="ko")
+
+    monkeypatch.setattr(library, "WhisperModel", Model)
+    service = AnalysisService(
+        Settings(
+            _env_file=None,
+            whisper_realtime_model="base",
+            whisper_repair_model="turbo",
+            realtime_review_enabled=review_enabled,
+        )
+    )
+    audio = decode_upload(wave_bytes(), 600)
+
+    async def run():
+        await service.warm_models()
+        assert loaded == (["base", "turbo"] if review_enabled else ["base"])
+        for _ in range(2):
+            result = await service.recheck_audio(audio, "ko", word_cutoff=0, end_cutoff=0.8)
+            assert result.text == "도와주세요"
+        assert loaded == ["base", "turbo"]
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("realtime", [False, True])
@@ -166,7 +221,16 @@ def test_runaway_repetition_gets_one_retry_and_keeps_other_speech(repair_succeed
     assert calls[0]["no_repeat_ngram_size"] > 0
 
 
-@pytest.mark.parametrize("text", ["네 네 네 네 네 네", "구 구 구", "구토와 출혈이 있어요."])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "네 네 네 네 네 네",
+        "구 구 구",
+        "구토와 출혈이 있어요.",
+        "여기 서울이에요. 여기 서울은 맞아요. 지금 서울에 있어요.",
+        "비가 와요, 비가 와요, 비가 와요.",
+    ],
+)
 def test_ordinary_repetition_and_symptom_words_are_preserved(text):
     stt = WhisperTranscriber(Settings(_env_file=None))
     calls = []
@@ -180,3 +244,54 @@ def test_ordinary_repetition_and_symptom_words_are_preserved(text):
     assert result.text == text
     assert not result.warnings
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("retry", ["corrected", "empty", "neighbor_only", "split_loop"])
+def test_varied_korean_loop_is_retried_and_kept_out_of_transcript(retry):
+    stt = WhisperTranscriber(Settings(_env_file=None))
+    calls = []
+    other = SimpleNamespace(start=0, end=0.35, text="여보세요.")
+    glitch = SimpleNamespace(start=0.4, end=1.6, text=VARIED_LOOP)
+
+    def decode(_waveform, **kwargs):
+        calls.append(kwargs)
+        pieces = [other, glitch]
+        if len(calls) == 2:
+            if retry == "corrected":
+                pieces = [other, SimpleNamespace(start=0.4, end=1.6, text="신호가 약해요.")]
+            elif retry == "empty":
+                pieces = []
+            elif retry == "neighbor_only":
+                pieces = [other]
+            else:
+                words = VARIED_LOOP.split()[:16]
+                pieces = [
+                    SimpleNamespace(start=0.4, end=1, text=" ".join(words[:8])),
+                    SimpleNamespace(start=1, end=1.6, text=" ".join(words[8:])),
+                ]
+        return iter(pieces), SimpleNamespace(language="ko")
+
+    stt._model = SimpleNamespace(transcribe=decode)
+    result = stt.transcribe(decode_upload(wave_bytes(seconds=2), 600), "ko", realtime=True)
+    assert len(calls) == 2
+    assert calls[1]["repetition_penalty"] > calls[0]["repetition_penalty"]
+    if retry == "corrected":
+        assert result.text == "여보세요. 신호가 약해요."
+        assert not result.warnings
+    else:
+        assert result.text == "여보세요."
+        assert result.segments[-1].recognition_status == "needs_review"
+        assert REVIEW_WARNING in result.warnings
+
+
+def test_isolated_markup_is_excluded_from_transcript():
+    stt = WhisperTranscriber(Settings(_env_file=None))
+    segments = [
+        SimpleNamespace(start=0, end=0.3, text="- \\", words=[]),
+        SimpleNamespace(start=0.3, end=1, text="주소는 12번지예요.", words=[]),
+    ]
+    stt._model = SimpleNamespace(
+        transcribe=lambda *args, **kwargs: (iter(segments), SimpleNamespace(language="ko"))
+    )
+    result = stt.transcribe(decode_upload(wave_bytes(), 600), "ko", realtime=True)
+    assert result.text == "주소는 12번지예요."

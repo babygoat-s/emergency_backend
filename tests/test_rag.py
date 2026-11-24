@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,7 +10,8 @@ from app.config import Settings
 from app.rag.engine import RagEngine, conditions_met
 from app.rag.enrichment import Enrichment, QuestionDraft
 from app.rag.extract import question_parts
-from app.rag.llm import RagLLM
+from app.rag.llm import RagLLM, compact_request
+from app.rag.question_bank import matches_question_focus
 from app.rag.rules import binding_for
 from app.rag.schemas import (
     ConsultationState,
@@ -20,6 +22,7 @@ from app.rag.schemas import (
     UrgencyProposal,
 )
 from app.rag.state import update_state
+from app.schemas import SpeakerSpan, Symptom
 
 
 @pytest.fixture
@@ -132,6 +135,221 @@ def test_reported_vomiting_is_extracted_as_current_information(engine):
     result = engine.recommend([caller("어머니가 토한다고 해요.")])
     assert result.state.fields["vomiting"].value == "yes"
     assert "P10" in result.state.protocol_ids
+
+
+def test_question_selection_prioritizes_reported_symptom_and_gates_scene_safety(engine):
+    specific = engine._store.questions[0].model_copy(
+        update={
+            "id": "sudden-headache",
+            "text": "두통이 갑자기 발생했습니까?",
+            "source": engine._store.questions[0].source.model_copy(
+                update={"protocol_id": "P03", "question_id": "sudden-headache"}
+            ),
+        }
+    )
+    engine._store.questions.append(specific)
+    engine._store.bindings[specific.id] = binding_for(specific)
+    result = engine.recommend(
+        [caller("머리가 아파요. 의식은 또렷하고 호흡은 정상입니다.")], semantic=False
+    )
+    assert result.questions[0].question == "머리가 갑자기 아프기 시작했나요?"
+    assert "scene_safety" not in [q.field for q in result._candidates]
+    assert "scene_safety" not in engine.question_context(result)[0]
+    collision = engine.recommend([caller("교통사고가 났어요.")], semantic=False)
+    safety = next(q for q in collision.questions if q.field == "scene_safety")
+    assert safety.question == "지금 신고하시는 곳은 안전한가요?"
+    assert safety.source_excerpt == "당신은 안전합니까?"
+
+
+def test_fainting_questions_follow_report_and_all_displayed_candidates_are_rewritten(engine):
+    assert not matches_question_focus("repeated_syncope", "쓰러진 일이 두 번 이상 있었나요?")
+    templates = [
+        "의식이 또렷합니까?",
+        "호흡이 정상입니까?",
+        "약물을 과량 섭취하였습니까?",
+        "두 번 이상 실신을 하였습니까?",
+    ]
+    for order, question in enumerate(templates):
+        source = engine._store.questions[0].source.model_copy(
+            update={"protocol_id": "P12", "question_id": f"faint-{order}"}
+        )
+        chunk = ManualChunk(
+            id=source.question_id,
+            source=source,
+            protocol_name="실신",
+            kind="question",
+            text=question,
+            order=order,
+        )
+        engine._store.questions.append(chunk)
+        engine._store.bindings[chunk.id] = binding_for(chunk)
+    engine.settings.rag_llm_provider = "openai_compatible"
+    engine.settings.rag_llm_compact_request = True
+    turns = [caller("할머니가 쓰러졌어요.")]
+    original = engine.recommend(turns, semantic=False)
+    assert [q.field for q in original.questions] == [
+        "consciousness",
+        "breathing",
+        "repeated_syncope",
+    ]
+    assert original.questions[0].question.startswith("쓰러졌다고 하셨는데")
+    assert all(q.question != q.source_excerpt for q in original.questions)
+    assert "P12" not in engine.recommend([caller("어지럽고 쓰러질 것 같아요.")]).state.protocol_ids
+    exposure = engine.recommend([caller("약을 먹고 쓰러졌어요.")], semantic=False)
+    assert any(q.source.question_id == "faint-2" for q in exposure.questions)
+    single = engine.recommend([caller("환자가 실신했어요.")], semantic=False)
+    assert any(q.field == "repeated_syncope" for q in single.questions)
+
+    engine._llm = RagLLM(engine.settings)
+
+    async def request_impl(_provider, _key, payload):
+        inputs, schema = compact_request(payload)
+        assert list(inputs["candidates"]) == ["question_1", "question_2", "question_3"]
+        assert set(schema["required"]) == {
+            "summary",
+            "summary_turn",
+            "question_1",
+            "question_2",
+            "question_3",
+        }
+        return json.dumps(
+            {
+                "summary": "신고자는 할머니가 쓰러졌다고 보고했습니다.",
+                "summary_turn": "0",
+                "question_1": "할머니가 지금 말을 걸면 또렷하게 대답하시나요?",
+                "question_2": "할머니는 지금 평소처럼 숨을 쉬시나요?",
+                "question_3": "할머니가 쓰러지면서 의식을 잃은 적이 두 번 이상 있었나요?",
+            }
+        )
+
+    engine._llm._request_impl = request_impl
+    refined = asyncio.run(engine.refine(turns, original))
+    assert [q.source for q in refined.questions] == [q.source for q in original.questions]
+    assert all(q.selection_origin == "llm_rewrite" for q in refined.questions)
+    assert refined.questions[0].question.startswith("쓰러졌다고 하셨는데")
+
+
+def test_realtime_llm_tasks_send_only_their_output_fields_and_needed_context():
+    payload = {
+        "task": "rewrite_questions_only",
+        "conversation": [
+            {"id": str(index), "speaker": "caller", "text": "환자가 가슴이 아프다고 합니다."}
+            for index in range(8)
+        ],
+        "state": {"fields": {"protocol:P17": {"status": "confirmed", "value": "yes"}}},
+        "source_candidates": [{"candidate_id": "q1", "question": "지금 숨을 쉬나요?"}],
+        "requires_immediate_operator_review": False,
+    }
+    inputs, schema = compact_request(payload)
+    assert schema["required"] == ["question_1"]
+    assert len(inputs["conversation"]) == 6
+    assert not inputs["known_state"]
+    payload["task"] = "summarize_consultation"
+    inputs, schema = compact_request(payload)
+    assert schema["required"] == ["summary", "summary_turn"]
+    assert set(inputs) == {"conversation"}
+    assert len(inputs["conversation"]) == 8
+
+
+def test_syncope_rewrite_must_ask_about_patient_state(engine):
+    chunk = engine._store.questions[0].model_copy(
+        update={
+            "id": "syncope",
+            "text": "실신을 했거나, 일으키면 쓰려지려 합니까?",
+            "source": engine._store.questions[0].source.model_copy(
+                update={"protocol_id": "P10", "question_id": "syncope"}
+            ),
+        }
+    )
+    engine._store.questions.append(chunk)
+    engine._store.bindings[chunk.id] = binding_for(chunk)
+    turns = [caller("환자가 토하고 있어요. 의식은 또렷하고 호흡은 정상입니다.")]
+    original = engine.recommend(turns, semantic=False)
+    engine._llm = SimpleNamespace(
+        enrich=AsyncMock(
+            return_value=Enrichment(
+                state=original.state,
+                status="completed",
+                questions=[
+                    QuestionDraft(
+                        candidate_id=chunk.id,
+                        question="환자분, 지금 쓰러질까 봐 걱정되시나요?",
+                        reason="실신 확인",
+                        source_ids=[chunk.id],
+                    )
+                ],
+            )
+        )
+    )
+    result = asyncio.run(engine.refine(turns, original))
+    question = next(q for q in result.questions if q.field == "syncope")
+    assert question.selection_origin == "developer_rule"
+    assert "의식을 잃었거나" in question.question
+    assert question.source_excerpt == chunk.text
+
+
+@pytest.mark.parametrize(
+    ("protocol", "category", "criterion", "report", "matches"),
+    [
+        ("P08", "긴급", "무의식 혹은 무호흡", "지금 숨을 전혀 쉬지 않습니다.", True),
+        ("P08", "긴급", "무의식 혹은 무호흡", "숨을 안 쉬는 건 아니에요.", False),
+        ("P08", "긴급", "무의식 혹은 무호흡", "숨을 안 쉬면 어떻게 해요", False),
+        ("P08", "긴급", "무의식 혹은 무호흡", "저는 숨을 못 쉬겠어요.", False),
+        ("P08", "긴급", "호흡 여부가 불명확", "숨을 쉬는지 모르겠어요.", True),
+        ("P08", "긴급", "호흡 여부가 불명확", "숨을 정상적으로 쉬는지 모르겠어요.", False),
+        ("P03", "긴급", "구토가 동반된 두통", "머리가 아프고 계속 토해요.", True),
+        ("P03", "긴급", "구토가 동반된 두통", "머리가 아프고 토하지 않아요.", False),
+        (
+            "P03",
+            "긴급",
+            "구토가 동반된 두통",
+            "환자가 2명이고 한 명은 머리가 아프고 다른 한 명은 토해요.",
+            False,
+        ),
+        (
+            "P29",
+            "응급",
+            "지혈된 열상",
+            "찢어진 상처는 지혈됐어요. 의식은 또렷하고 호흡은 정상입니다.",
+            True,
+        ),
+        ("P29", "응급", "지혈된 열상", "찢어진 상처는 지혈됐어요.", False),
+    ],
+)
+def test_manual_urgency_uses_confirmed_current_report_and_source(
+    engine, protocol, category, criterion, report, matches
+):
+    engine.settings.rag_llm_provider = "openai_compatible"
+    engine.settings.rag_llm_compact_request = True
+    engine._store.chunks.append(
+        ManualChunk(
+            id="classification",
+            source=engine._store.chunks[0].source.model_copy(
+                update={"protocol_id": protocol, "question_id": None}
+            ),
+            protocol_name="fixture",
+            kind="classification",
+            text=criterion,
+            source_category=category,
+            order=0,
+        )
+    )
+    previous = ConsultationState(
+        fields={
+            "breathing": Observation(
+                status="confirmed", value="absent", turn_id="0", evidence=report
+            )
+        }
+    )
+    result = engine.recommend([caller(report)], previous=previous, semantic=False)
+    if matches:
+        assert result.manual_urgency.reference.category == category
+        assert result.manual_urgency.reference.text == criterion
+        assert all(quote.quote in report for quote in result.manual_urgency.evidence)
+        assert category in result.urgency.reason
+    else:
+        assert result.manual_urgency is None
+    assert result.urgency.origin == "unavailable"
 
 
 def test_operator_questions_are_not_facts_and_answer_respects_polarity(engine):
@@ -251,7 +469,7 @@ def test_extraction_preserves_order_and_separates_arrow_notes():
     assert all("☞" not in part[1] for part in parts)
 
 
-def test_text_api_validates_history_and_exposes_grounded_questions(backend, engine):
+def test_text_api_validates_history_and_omits_questions_when_llm_is_not_requested(backend, engine):
     backend.service.rag = engine
     response = backend.client.post(
         "/api/v1/rag/recommend",
@@ -262,8 +480,7 @@ def test_text_api_validates_history_and_exposes_grounded_questions(backend, engi
     )
     assert response.status_code == 200
     body = response.json()
-    assert 1 <= len(body["questions"]) <= 3
-    assert body["questions"][0]["source"]["pdf_page"] == 8
+    assert body["questions"] == []
     assert "연구용" in body["research_notice"]
     response = backend.client.post(
         "/api/v1/rag/recommend",
@@ -275,7 +492,46 @@ def test_text_api_validates_history_and_exposes_grounded_questions(backend, engi
     assert response.status_code == 422
 
 
-def test_audio_pipeline_uses_rag_questions_in_final_response(backend, engine):
+@pytest.mark.parametrize("supported", [True, False])
+def test_text_api_splits_mixed_transcript_and_only_publishes_questions_with_grounded_summary(
+    backend, engine, supported
+):
+    engine.settings.rag_llm_provider = "openai_compatible"
+    engine.settings.rag_llm_compact_request = True
+    engine._llm = RagLLM(engine.settings)
+    backend.service.rag = engine
+
+    async def respond(_provider, _key, payload):
+        inputs, schema = compact_request(payload)
+        assert inputs["conversation"][0][2] == "환자가 가슴이 아파요."
+        assert schema["properties"]["summary"]["minLength"] == 1
+        return json.dumps(
+            {
+                "summary": "가슴 통증이 보고되었습니다." if supported else "체온이 39도입니다.",
+                "summary_turn": "0",
+                "question_1": "지금 환자분에게 의식이 있나요?",
+            }
+        )
+
+    engine._llm._request_impl = respond
+    response = backend.client.post(
+        "/api/v1/rag/recommend",
+        json={"conversation": [{"id": "0", "text": "39도인가요? 환자가 가슴이 아파요."}]},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    if supported:
+        assert result["llm_status"] == "completed"
+        assert result["summary"] == "가슴 통증이 보고되었습니다."
+        assert [item["selection_origin"] for item in result["questions"]] == ["llm_rewrite"]
+    else:
+        assert result["llm_status"] == "partial"
+        assert result["llm_error_code"] == "SUMMARY_UNGROUNDED"
+        assert result["summary"] is None
+        assert result["questions"] == []
+
+
+def test_audio_pipeline_omits_questions_when_llm_is_disabled(backend, engine):
     from app.schemas import AnalysisResponse, Transcript
 
     backend.service.rag = engine
@@ -288,16 +544,29 @@ def test_audio_pipeline_uses_rag_questions_in_final_response(backend, engine):
     )
     completed = asyncio.run(backend.service.complete(result))
     assert backend.analyzer.calls == []
-    assert completed.manual_grounded
+    assert not completed.manual_grounded
     assert completed.analysis is None
     assert completed.rag.summary is None
     assert completed.rag.summary_provider == "disabled"
-    assert [q.question for q in completed.local_questions] == [
-        q.question for q in completed.rag.questions
-    ]
+    assert completed.local_questions == completed.rag.questions == []
 
 
-def test_realtime_audio_event_already_contains_source_questions(backend, engine):
+def test_compact_rag_uses_structural_candidates_while_semantic_search_loads(engine):
+    engine.settings.rag_llm_provider = "openai_compatible"
+    engine.settings.rag_llm_compact_request = True
+    engine._store.semantic_ready = False
+
+    def unavailable_search(*args, **kwargs):
+        raise AssertionError("A request must not wait for the cold embedding model")
+
+    engine._store.search = unavailable_search
+    result = engine.recommend([caller("머리가 아파요.")])
+    assert result.retrieval["mode"] == "structural"
+    assert "warning" not in result.retrieval
+    assert result.questions
+
+
+def test_realtime_audio_event_keeps_rag_state_without_pending_questions(backend, engine):
     backend.service.rag = engine
     backend.service.settings.rag_enabled = True
     with backend.client.websocket_connect("/api/v1/analysis/realtime") as socket:
@@ -306,16 +575,133 @@ def test_realtime_audio_event_already_contains_source_questions(backend, engine)
         socket.send_bytes(b"\x01\x00" * 8000)
         event = socket.receive_json()
         assert event["stage"] == "audio"
-        assert event["data"]["rag"]["questions"]
-        assert event["data"]["manual_grounded"]
+        assert event["data"]["rag"]["questions"] == event["data"]["local_questions"] == []
+        assert not event["data"]["manual_grounded"]
+        assert event["data"]["rag"]["state"]
         socket.send_json({"type": "finish"})
         while socket.receive_json()["type"] != "finished":
             pass
 
 
+def test_realtime_runs_questions_and_symptoms_independently_and_summarizes_final_tail(
+    backend, engine
+):
+    for settings in (backend.service.settings, engine.settings):
+        settings.rag_enabled = True
+        settings.rag_llm_provider = "openai_compatible"
+        settings.rag_llm_compact_request = True
+    backend.service.rag = engine
+    classifier_started = threading.Event()
+    speaker_started = threading.Event()
+    release_classifier = threading.Event()
+    second_question_started = threading.Event()
+    question_cancelled = threading.Event()
+    classifier_counts, speaker_durations, question_counts, summary_counts = [], [], [], []
+
+    def classify(text):
+        classifier_counts.append(text.count("쓰러지셨어요."))
+        classifier_started.set()
+        assert release_classifier.wait(10)
+        return [Symptom(code="altered_consciousness", label="의식 저하")]
+
+    backend.service.classifier = SimpleNamespace(name="test-symptoms", predict=classify)
+
+    def diarize(audio, _state):
+        speaker_durations.append(audio.duration_seconds)
+        speaker_started.set()
+        assert release_classifier.wait(10)
+        return [
+            SpeakerSpan(start=0, end=audio.duration_seconds, role="caller", speaker_id="caller")
+        ]
+
+    backend.service.diarizer = SimpleNamespace(name="test-speakers", diarize=diarize)
+
+    async def enrich(turns, result, context, *, questions_only=False, summary_only=False):
+        if summary_only:
+            summary_counts.append(len(turns))
+            # The final lookup can rank a different source for an unanswered field.
+            result._candidates = []
+            return Enrichment(
+                state=result.state, status="completed", summary="신고자가 쓰러짐을 보고했습니다."
+            )
+        assert questions_only
+        question_counts.append(len(turns))
+        if len(question_counts) > 1:
+            second_question_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                question_cancelled.set()
+        question = next(item for item in result.questions if item.field == "consciousness")
+        return Enrichment(
+            state=result.state,
+            status="completed",
+            questions=[
+                QuestionDraft(
+                    candidate_id=question.source.question_id,
+                    question="지금 아버님이 말을 걸면 반응하시나요?",
+                    reason="의식 확인",
+                    source_ids=[question.source.question_id],
+                )
+            ],
+        )
+
+    engine._llm = SimpleNamespace(enrich=enrich, close=AsyncMock())
+    frame = b"\x01\x00" * 8000
+    with backend.client.websocket_connect("/api/v1/analysis/realtime") as socket:
+        socket.send_json({"type": "start"})
+        assert socket.receive_json()["type"] == "ready"
+        try:
+            socket.send_bytes(frame)
+            assert socket.receive_json()["stage"] == "audio"
+            assert classifier_started.wait(2)
+            assert speaker_started.wait(2)
+            questions = socket.receive_json()
+            assert questions["stage"] == "analysis"
+            assert questions["data"]["rag"]["summary"] is None
+            assert questions["data"]["rag"]["questions"][0]["selection_origin"] == "llm_rewrite"
+            socket.send_bytes(frame)
+            second = socket.receive_json()
+            assert (second["stage"], second["sequence"]) == ("audio", 2)
+            assert second_question_started.wait(2)
+            socket.send_bytes(frame)
+            third = socket.receive_json()
+            assert (third["stage"], third["sequence"]) == ("audio", 3)
+            release_classifier.set()
+            while True:
+                live = socket.receive_json()
+                assert live["type"] == "update", live
+                if (live["stage"], live["sequence"]) == ("symptoms", 3):
+                    break
+            assert live["data"]["symptoms"][0]["label"] == "의식 저하"
+            socket.send_bytes(frame[: len(frame) // 2])
+            socket.send_json({"type": "finish"})
+        finally:
+            release_classifier.set()
+        updates = []
+        while (event := socket.receive_json())["type"] != "finished":
+            updates.append(event)
+    summaries = [
+        event
+        for event in updates
+        if event["stage"] == "analysis" and event["data"]["rag"]["summary"]
+    ]
+    assert [event["sequence"] for event in summaries] == [4]
+    final = summaries[0]["data"]
+    assert final["rag"]["questions"] == questions["data"]["rag"]["questions"]
+    assert final["symptoms"] == live["data"]["symptoms"]
+    assert final["speakers"]["segments"][-1]["end"] == 1.75
+    assert all(segment["speaker"] == "caller" for segment in final["transcript"]["segments"])
+    assert question_cancelled.is_set()
+    assert classifier_counts == [1, 2, 3, 4]
+    assert speaker_durations == [0.5, 0.5, 0.5, 0.25]
+    assert question_counts == [1, 2]
+    assert summary_counts == [4]
+
+
 @pytest.mark.parametrize("preamble", ["", "두통을 호소하는 환자분을 돕고 계신 상황입니다."])
 def test_llm_rewrites_with_matching_sources_and_preserves_raw_excerpt(engine, preamble):
-    turns = [caller("머리가 아파요.")]
+    turns = [caller("교통사고가 났어요. 머리가 아파요.")]
     original = engine.recommend(turns, semantic=False)
     primary = original.questions[0]
     extra = engine._store.questions[0].model_copy(deep=True)
@@ -362,7 +748,7 @@ def test_llm_rewrites_with_matching_sources_and_preserves_raw_excerpt(engine, pr
 
 
 @pytest.mark.parametrize(
-    "invalid", ["unknown_source", "other_field", "new_number", "missing_primary"]
+    "invalid", ["unknown_source", "other_field", "new_number", "missing_primary", "out_of_context"]
 )
 def test_unsupported_llm_rewrites_fall_back_to_source(engine, invalid):
     turns = [caller("머리가 아파요.")]
@@ -376,8 +762,10 @@ def test_unsupported_llm_rewrites_fall_back_to_source(engine, invalid):
         source_ids.append(original.questions[1].source.question_id)
     elif invalid == "missing_primary":
         source_ids = [original.questions[1].source.question_id]
-    else:
+    elif invalid == "new_number":
         text = "환자에게 999라는 수치가 있습니까?"
+    else:
+        text = "지금 신고하시는 곳은 안전한가요?"
 
     async def enrich(turns, result, context):
         return Enrichment(
@@ -401,7 +789,7 @@ def test_unsupported_llm_rewrites_fall_back_to_source(engine, invalid):
 
 
 def test_new_llm_facts_remove_answered_questions_before_rewrite(engine):
-    turns = [caller("머리가 아파요. 이곳은 괜찮아요.")]
+    turns = [caller("교통사고가 났어요. 이곳은 괜찮아요.")]
     original = engine.recommend(turns, semantic=False)
 
     async def enrich(turns, result, context):
@@ -432,6 +820,7 @@ def test_new_llm_facts_remove_answered_questions_before_rewrite(engine):
     assert "scene_safety" not in [q.field for q in result.questions]
     assert len(result.questions) == 3
     assert original.state.fields["scene_safety"].status == "unknown"
+    assert "scene_safety" in [q.field for q in original.questions]
 
 
 def test_text_api_returns_llm_summary_and_grounded_contextual_questions(backend, engine):
@@ -449,11 +838,11 @@ def test_text_api_returns_llm_summary_and_grounded_contextual_questions(backend,
                 },
                 "questions": [
                     {
-                        "candidate_id": "scene_safety",
+                        "candidate_id": "consciousness",
                         "context": "두통을 호소하는 환자분을 돕고 계신 상황입니다.",
-                        "question": "두통이 있는 환자분을 돕고 있는 지금 신고자분은 안전한가요?",
-                        "reason": "신고자의 안전이 확인되지 않았습니다.",
-                        "source_ids": ["scene_safety"],
+                        "question": "머리가 아픈 환자분은 지금 의식이 있나요?",
+                        "reason": "환자의 의식 상태를 확인합니다.",
+                        "source_ids": ["consciousness"],
                     }
                 ],
             }
@@ -505,6 +894,7 @@ def test_rag_503_recovers_after_finish_without_stopping_transcription(backend, e
         assert initial["stage"] == "analysis"
         assert initial["data"]["rag"]["llm_status"] == "unavailable"
         assert initial["data"]["rag"]["summary"] is None
+        assert initial["data"]["rag"]["questions"] == initial["data"]["local_questions"] == []
         assert initial["data"]["transcript"]["text"]
         socket.send_json({"type": "finish"})
         completed = socket.receive_json()

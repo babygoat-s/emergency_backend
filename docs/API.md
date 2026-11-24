@@ -15,7 +15,7 @@ RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니�
 
 ## 현재 개인정보·AI 설정
 
-현재는 `RAG_LLM_PROVIDER=disabled`이며 요약·긴급도 AI를 보류한다. 파일/실시간의 `status=completed`, `analysis=null`은 오류가 아니고 로컬 전사·증상·`rag.questions` 및 `local_questions`가 결과다. `rag.summary=null`, `summary_provider=disabled`, `llm_status=disabled`, `urgency.origin=unavailable`이며 긴급도 단계를 부여하지 않는다. 이후 문서의 LLM 응답 JSON은 선택적 활성화 구성의 호환 예시다.
+기본 실행 환경은 로컬 Ollama를 사용한다. 모델 호출에 실패한 경우 전사·증상·매뉴얼 확인 경고를 반환하며 후속 질문 배열은 비어 있다. `RAG_LLM_PROVIDER=disabled`를 설정한 경우 파일/실시간 응답의 `analysis`는 null이며 `rag.summary_provider`와 `rag.llm_status`는 disabled다.
 
 설정 응답에는 `llm_privacy_mode`, `llm_local_configured`, `llm_external_enabled`, `llm_features_enabled`를 추가했다. 이 정보가 없는 구버전 서버에는 프런트엔드가 고정 예시 외 입력을 보내지 않는다. `llm_local_configured`는 설정 유무이며 모델 품질·가용성 보장이 아니다.
 
@@ -204,7 +204,7 @@ JSON text 메시지:
 
 `data`는 파일 분석의 `AnalysisResponse`와 같은 구조입니다. `sequence`는 입력 구간 번호이며 같은 구간의 `audio`와 `analysis`는 같은 번호입니다. 서로 다른 구간의 응답은 순서가 바뀔 수 있습니다. `window.start/end`와 모든 발화 시간은 세션 시작 기준 초입니다.
 
-`audio` 단계는 `analysis=null`, 새 발화가 있으면 `status=pending`과 `local_questions`를 보내며, 없으면 `status=no_speech`입니다. 전사와 화자 구간은 누적됩니다. 경계에서 복구한 전사 타임스탬프는 직전 `window`에 걸칠 수 있습니다. `analysis` 단계는 완료 시 `status=completed`, 실패 시 `status=unavailable`, `analysis=null`입니다. 상황 분석 실패 시 연결과 기본 확인 질문은 유지됩니다.
+`audio` 단계는 `analysis=null`이며 새 발화가 있으면 `status=pending`, 없으면 `status=no_speech`입니다. 전사와 화자 구간은 누적됩니다. 경계에서 복구한 전사 타임스탬프는 직전 `window`에 걸칠 수 있습니다. 로컬 Ollama 모드의 녹음 중 `analysis` 이벤트는 별도로 검증된 질문을 반환하고 `rag.summary`는 null입니다. `rag.questions_status`는 질문 작업 상태이며, 질문 작업이 실패하면 `rag.questions`와 `local_questions`는 비어 있습니다. 증상 분류는 녹음 중 전사가 갱신될 때마다 `symptoms` 이벤트로 반환합니다. `finish` 이후 마지막 음성까지 전사와 화자 분류를 처리한 뒤 최종 `analysis` 이벤트에 요약을 반환합니다. 녹음 중 검증된 후속 질문 중 마지막 전사에서도 유효한 질문은 요약 결과에 함께 반환합니다. 전사와 매뉴얼 확인 경고는 개별 LLM 호출 상태와 독립적으로 반환됩니다.
 
 녹음 중 상황 분석은 `realtime_analysis_min_interval_seconds` 이상의 간격으로 최신 누적 전사를 사용합니다. Gemini 503 이후에는 대기 시간이 지난 뒤 최신 전사를 한 번 재시도하므로 같은 `sequence`의 `analysis` 이벤트가 오류와 성공으로 각각 도착할 수 있습니다. 종료 시 503 대기가 남아 있으면 기본 질문을 남기고 `finished`를 반환합니다.
 
@@ -313,6 +313,6 @@ JSON text 메시지:
 `gemini_configured`는 키 입력 여부를 나타내는 boolean이며, 실제 모델 실행이나 외부 API 호출 성공 여부를 나타내지는 않습니다.
 
 
-RAG LLM은 LangChain으로 연결합니다. `rag.summary`는 LLM 종합 요약이며 실패 시 null이고 발화를 대신 넣지 않습니다. `rag.summary_provider`는 llm/pending/unavailable/disabled입니다. `rag.urgency`는 level/reason/evidence/origin으로 검토용 5단계 제안과 발화 근거를 제공합니다. 음성 응답의 `analysis.urgency`도 이 제안을 사용합니다. `rag.retry_after_seconds`는 재시도 대기 시간, `rag.llm_model`은 성공한 모델입니다. 실시간 update의 `processing_lag_seconds`는 아직 전사하지 못한 입력 길이입니다. 이는 연결 종료 오류가 아닙니다.
+기본 로컬 LLM은 `rag.summary`의 요약과 매뉴얼 질문 문구를 생성합니다. 규칙에 부합한 신고는 `rag.manual_urgency`에 `reference`(매뉴얼 분류, 원문, PDF 출처)와 `evidence`(신고 발화 인용)를 반환합니다. 일치하는 규칙이 없으면 필드는 null입니다. `rag.urgency.reason`에도 매뉴얼 판정이 포함되며 기존 5단계 호환 필드인 `level`과 `origin`은 각각 unknown과 unavailable로 반환됩니다. 즉시 확인 여부와 경고는 `rag.requires_immediate_operator_review`와 `rag.safety_alerts`에 포함됩니다.
 
 음성 상태 추정 계약은 제거했습니다. 응답과 설정에는 해당 필드가 없습니다. `rag.urgency.origin`은 llm 또는 unavailable이며, llm이 아닌 경우 5단계 결과를 표시하지 않습니다. 유효한 결과를 얻기 전의 분석 대기·미완료와 LLM이 정보 부족으로 반환한 unknown(판단 보류)을 구분합니다.

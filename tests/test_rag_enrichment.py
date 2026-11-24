@@ -2,6 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from google.genai.errors import ClientError, ServerError
 from langchain_core.messages import AIMessage
@@ -262,6 +263,12 @@ def test_wrapped_provider_error_is_classified_without_exposing_message():
     assert error_details(wrapper) == (503, "UPSTREAM_UNAVAILABLE")
 
 
+def test_connection_refusal_has_specific_error_reason():
+    error = httpx.ConnectError("private connection detail")
+    error.__cause__ = OSError("socket refused")
+    assert error_details(error) == (None, "CONNECTION_FAILED")
+
+
 def test_application_timeout_stays_bounded_independent_of_provider_deadline():
     llm = RagLLM(
         Settings(_env_file=None, rag_llm_provider="openai_compatible", rag_llm_timeout_seconds=0.01)
@@ -276,3 +283,4 @@ def test_application_timeout_stays_bounded_independent_of_provider_deadline():
     enriched = asyncio.run(llm.enrich([Turn(id="0", text="가상 증상")], original))
     assert enriched.status == "unavailable"
     assert enriched.error_code == "TIMEOUT"
+    assert enriched.retry_after_seconds == 0

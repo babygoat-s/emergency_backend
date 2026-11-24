@@ -77,6 +77,10 @@ class UrgencyProposal(RagModel):
     evidence: list[Quote] = Field(default_factory=list, max_length=10)
     origin: Literal["llm", "unavailable"] = "unavailable"
 
+    @classmethod
+    def operator_review(cls):
+        return cls(reason="긴급도는 상담원이 직접 판단합니다.")
+
 
 class Recommendation(RagModel):
     question: str
@@ -97,6 +101,11 @@ class Reference(RagModel):
     category: Literal["긴급", "응급", "비응급"] | None = None
 
 
+class ManualUrgency(RagModel):
+    reference: Reference
+    evidence: list[Quote]
+
+
 class RagResult(RagModel):
     status: Literal["ready", "insufficient_evidence", "index_unavailable"]
     state: ConsultationState
@@ -113,10 +122,33 @@ class RagResult(RagModel):
     llm_error_code: str | None = None
     summary: str | None = None
     summary_provider: Literal["llm", "pending", "unavailable", "disabled", "extractive"] = "pending"
+    questions_status: Literal["completed", "unavailable", "not_needed"] | None = None
     urgency: UrgencyProposal = Field(default_factory=UrgencyProposal)
+    manual_urgency: ManualUrgency | None = None
     retry_after_seconds: float = 0
     llm_model: str | None = None
     _candidates: list[Recommendation] = PrivateAttr(default_factory=list)
+
+    def for_client(self):
+        complete = (
+            self.questions_status == "completed"
+            if self.questions_status is not None
+            else self.llm_status == "completed" and self.summary_provider == "llm" and self.summary
+        )
+        questions = (
+            [q for q in self.questions if q.selection_origin == "llm_rewrite"] if complete else []
+        )
+        message = self.message
+        if not self.requires_immediate_operator_review and self.status != "index_unavailable":
+            if self.questions_status == "not_needed":
+                message = "추가로 확인할 후속 질문이 없습니다."
+            elif not complete and self.llm_status in {"not_requested", "pending"}:
+                message = "LLM 분석이 완료되면 후속 질문을 표시합니다."
+            elif not complete:
+                message = "LLM 분석을 완료하지 못해 후속 질문을 표시하지 않습니다."
+            elif not questions:
+                message = "검증을 통과한 후속 질문이 없습니다."
+        return self.model_copy(update={"questions": questions, "message": message})
 
 
 class RecommendRequest(RagModel):

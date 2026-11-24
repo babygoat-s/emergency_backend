@@ -66,12 +66,22 @@ def numbers_supported(text: str, evidence: str) -> bool:
     return values(text) <= values(evidence)
 
 
+def report_statements(text: str, speaker: str) -> list[str]:
+    if speaker == "operator":
+        return []
+    statements = []
+    for part in re.split(r"(?<=[.!?。！？])(?!\d)\s*|\n+", text):
+        part = part.strip()
+        if not part or re.search(r"[?？]|(?:습니까|인가요|나요|까요)[.。]?$", part):
+            continue
+        if re.fullmatch(r"(?:네|예|아니요|아니오|알겠습니다|119입니다)[.!。！\s]*", part):
+            continue
+        statements.append(part)
+    return statements
+
+
 def reported_text(turns) -> str:
-    return " ".join(
-        turn.text
-        for turn in turns
-        if turn.speaker != "operator" and not re.search(r"[?？]|습니까|인가요|나요$", turn.text)
-    )
+    return " ".join(part for turn in turns for part in report_statements(turn.text, turn.speaker))
 
 
 def valid_quotes(quotes, turns) -> bool:

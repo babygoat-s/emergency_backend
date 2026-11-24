@@ -111,7 +111,7 @@ async def recommend_questions(payload: RecommendRequest, service: Service):
         ) from exc
     if payload.use_llm:
         result = await service.rag.refine(payload.conversation, result)
-    return result
+    return result.for_client()
 
 
 @router.get("/rag/status", summary="원문 인덱스 및 검토 현황")

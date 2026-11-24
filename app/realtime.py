@@ -9,11 +9,12 @@ from starlette.concurrency import run_in_threadpool
 from app.audio import BYTES_PER_SECOND, AudioInput
 from app.errors import ServiceError
 from app.providers.whisper import WhisperTranscriber
+from app.rag.engine import field_answered
 from app.recognition_quality import (
     REVIEW_FAILED,
     REVIEW_WARNING,
     is_acknowledgement,
-    suspicious_reply_runs,
+    suspicious_transcript_runs,
     trusted_text,
 )
 from app.schemas import AnalysisResponse, Question, StreamStart
@@ -22,17 +23,8 @@ from app.services import AnalysisService, assign_speaker
 MIN_PAUSE_CHECK_BYTES = int(1.5 * BYTES_PER_SECOND)
 PAUSE_CHECK_INTERVAL_BYTES = BYTES_PER_SECOND // 4
 STT_CONTEXT_BYTES = 6 * BYTES_PER_SECOND
+CATCH_UP_CONTEXT_BYTES = 2 * BYTES_PER_SECOND
 logger = logging.getLogger(__name__)
-
-
-def local_questions() -> list[Question]:
-    return [
-        Question(question="지금 환자를 부르면 반응하나요?", purpose="현재 반응 확인"),
-        Question(question="환자가 지금 숨을 쉬고 있나요?", purpose="현재 호흡 상태 확인"),
-        Question(
-            question="지금 어떤 증상이 있고 언제부터 시작됐나요?", purpose="증상과 시작 시각 확인"
-        ),
-    ]
 
 
 class RealtimeSession:
@@ -41,13 +33,28 @@ class RealtimeSession:
     def __init__(self, websocket: WebSocket, service: AnalysisService, start: StreamStart):
         self.ws, self.service, self.start = websocket, service, start
         self.settings = service.settings
+        self.split_analysis = (
+            self.settings.rag_enabled
+            and self.settings.rag_llm_provider == "openai_compatible"
+            and self.settings.rag_llm_compact_request
+        )
         self.window_bytes = int(self.settings.realtime_window_seconds * BYTES_PER_SECOND) // 2 * 2
         # Total PCM is already capped by max_audio_seconds in receive_audio.
         # Keep that bounded recording in memory instead of closing the socket
         # when a brief CPU stall fills a four-window queue.
         self.audio_queue = asyncio.Queue()
-        self.symptom_queue = asyncio.Queue(maxsize=1)
+        self.symptom_queue = asyncio.Queue(maxsize=0 if self.split_analysis else 1)
+        self.speaker_queue = asyncio.Queue()
+        self.rules_queue = asyncio.Queue(maxsize=1)
         self.analysis_queue = asyncio.Queue(maxsize=1)
+        self.recording_stopped = asyncio.Event()
+        self.transcription_finished = asyncio.Event()
+        self.speakers_finished = asyncio.Event()
+        self.symptoms_finished = asyncio.Event()
+        self.last_symptom_input = None
+        self.last_question_input = None
+        self.latest_symptoms = None
+        self.latest_questions = None
         self.send_lock = asyncio.Lock()
         self.total_bytes = 0
         self.windows_processed = 0
@@ -78,7 +85,12 @@ class RealtimeSession:
                 self.receive_audio,
                 self.process_audio,
                 self.process_symptoms,
-                self.process_analyses,
+                *(
+                    (self.process_live_rules, self.process_split_speakers)
+                    if self.split_analysis
+                    else ()
+                ),
+                self.process_split_analyses if self.split_analysis else self.process_analyses,
             )
         ]
         try:
@@ -121,6 +133,7 @@ class RealtimeSession:
                 raw = message["text"]
                 if len(raw) > 4096 or json.loads(raw) != {"type": "finish"}:
                     raise ServiceError(422, "INVALID_STREAM_MESSAGE", "finish 메시지가 필요합니다.")
+                self.recording_stopped.set()
                 if buffer:
                     # Flush the final partial window.
                     await self.audio_queue.put(AudioInput(pcm=bytes(buffer), start_seconds=offset))
@@ -205,7 +218,7 @@ class RealtimeSession:
         transcript = result.transcript
         suspicious = {
             id(segment)
-            for run in suspicious_reply_runs(transcript.segments)
+            for run in suspicious_transcript_runs(transcript.segments)
             for segment in run
             if segment.recognition_status == "recognized"
         }
@@ -228,7 +241,51 @@ class RealtimeSession:
             queue.get_nowait()
         queue.put_nowait(item)
 
+    @staticmethod
+    def transcript_key(result):
+        return result.transcript.text, result.transcript.revision
+
+    def enqueue_symptoms(self, sequence, window, result):
+        item = (sequence, window, result)
+        if not self.split_analysis:
+            self.enqueue_latest(self.symptom_queue, item)
+            return
+        key = self.transcript_key(result)
+        if key != self.last_symptom_input:
+            self.last_symptom_input = key
+            self.symptom_queue.put_nowait((sequence, window, result.model_copy()))
+
     async def send_update(self, stage, sequence, window, result, error=None):
+        if (
+            self.split_analysis
+            and self.cumulative
+            and sequence == self.windows_processed
+            and self.transcript_key(result) == self.transcript_key(self.cumulative)
+        ):
+            result = result.model_copy(
+                update={
+                    "transcript": self.cumulative.transcript,
+                    "speakers": self.cumulative.speakers,
+                }
+            )
+        if result.rag is not None:
+            rag = result.rag
+            if stage == "analysis" and error and rag.llm_status in {"not_requested", "pending"}:
+                rag = rag.model_copy(
+                    update={
+                        "llm_status": "unavailable",
+                        "llm_error_code": error["code"],
+                        "summary_provider": "unavailable",
+                    }
+                )
+            rag = rag.for_client()
+            result = result.model_copy(
+                update={
+                    "rag": rag,
+                    "manual_grounded": bool(rag.questions),
+                    "local_questions": result.local_questions if rag.questions else [],
+                }
+            )
         event = {
             "type": "update",
             "stage": stage,
@@ -248,15 +305,33 @@ class RealtimeSession:
         while True:
             audio = await self.take_audio()
             if audio is None:
+                self.recording_stopped.set()
+                if self.split_analysis:
+                    self.speaker_queue.put_nowait(None)
                 await self.recheck_suspicious_audio()
+                self.transcription_finished.set()
                 await self.symptom_queue.put(None)
+                if self.split_analysis:
+                    self.enqueue_latest(self.rules_queue, None)
                 return
             sequence = self.windows_processed + 1
             window = {
                 "start": audio.start_seconds,
                 "end": audio.start_seconds + audio.duration_seconds,
             }
-            context_seconds = len(context) / BYTES_PER_SECOND
+            backlog_seconds = self.total_bytes / BYTES_PER_SECOND - window["end"]
+            catching_up = (
+                use_context
+                and self.split_analysis
+                and (
+                    backlog_seconds >= self.settings.realtime_window_seconds
+                    or len(audio.pcm) > self.window_bytes
+                )
+            )
+            supplied_context = context
+            if catching_up:
+                supplied_context = context[-CATCH_UP_CONTEXT_BYTES:]
+            context_seconds = len(supplied_context) / BYTES_PER_SECOND
             transcript_sent = False
 
             async def publish_transcript(early):
@@ -271,17 +346,27 @@ class RealtimeSession:
                 self.start.language,
                 self.speaker_state,
                 realtime=True,
-                stt_context=context,
+                stt_context=supplied_context,
+                stt_catching_up=catching_up,
                 committed_end=committed_end,
-                on_transcript=publish_transcript if use_context else None,
+                on_transcript=publish_transcript
+                if use_context and not self.split_analysis
+                else None,
+                **({"defer_diarization": True} if self.split_analysis else {}),
             )
-            has_speech = bool(result.transcript.text)
-            if use_context and has_speech and self.settings.rag_enabled and not transcript_sent:
+            has_speech = bool(result.transcript.text or result.transcript.segments)
+            if (
+                not self.split_analysis
+                and use_context
+                and has_speech
+                and self.settings.rag_enabled
+                and not transcript_sent
+            ):
                 await publish_transcript(result.model_copy())
             result = self.accumulate(result, audio, context_seconds)
             if use_context:
                 self.flag_uncertain_replies(result)
-            self.cumulative = result.model_copy(deep=True)
+            self.cumulative = result if self.split_analysis else result.model_copy(deep=True)
             if result.transcript.segments:
                 committed_end = result.transcript.segments[-1].end
             # A short pause need not end the sentence. Keep acoustic context at
@@ -290,15 +375,19 @@ class RealtimeSession:
                 context = (context + audio.pcm)[-STT_CONTEXT_BYTES:]
             else:
                 context = b""
-            if has_speech:
-                if self.settings.rag_enabled:
-                    await self.service.prepare_rag(result, semantic=False)
-                else:
-                    result.local_questions = local_questions()
+            if has_speech and self.settings.rag_enabled and not self.split_analysis:
+                await self.service.prepare_rag(result, semantic=False)
             self.windows_processed = sequence
             await self.send_update("audio", sequence, window, result)
             if has_speech:
-                self.enqueue_latest(self.symptom_queue, (sequence, window, result))
+                self.enqueue_symptoms(sequence, window, result)
+                if self.split_analysis:
+                    self.speaker_queue.put_nowait(audio)
+                if self.split_analysis and not self.recording_stopped.is_set():
+                    key = self.transcript_key(result)
+                    if key != self.last_question_input:
+                        self.last_question_input = key
+                        self.enqueue_latest(self.rules_queue, (sequence, window, result))
 
     async def take_audio(self):
         """Catch up using contiguous PCM, never by dropping or speeding up audio."""
@@ -345,7 +434,7 @@ class RealtimeSession:
             return
         runs = [
             run
-            for run in suspicious_reply_runs(self.cumulative.transcript.segments)
+            for run in suspicious_transcript_runs(self.cumulative.transcript.segments)
             if any(s.recognition_status == "needs_review" for s in run)
         ]
         if not runs or not self.raw_pcm:
@@ -377,11 +466,15 @@ class RealtimeSession:
         except ServiceError:
             review = None
         result = self.cumulative.model_copy(deep=True)
-        if (
-            review is None
-            or not review.text
-            or all(is_acknowledgement(s.text) for s in review.segments)
-        ):
+        accepted = []
+        if review is not None and review.text:
+            suspect = {id(s) for run in suspicious_transcript_runs(review.segments) for s in run}
+            accepted = [
+                s
+                for s in review.segments
+                if s.recognition_status != "needs_review" and id(s) not in suspect
+            ]
+        if not any(not is_acknowledgement(s.text) for s in accepted):
             result.warnings = list(dict.fromkeys(result.warnings + [REVIEW_FAILED]))
         else:
             replacement = [
@@ -392,13 +485,10 @@ class RealtimeSession:
                         "recognition_status": "rechecked",
                     }
                 )
-                for s in review.segments
+                for s in accepted
             ]
             for segment in replacement:
                 assign_speaker(segment, result.speakers.segments, result.speakers.available)
-            for repeated in suspicious_reply_runs(replacement):
-                for segment in repeated:
-                    segment.recognition_status = "needs_review"
             # A reviewer may return only the middle of the requested interval.
             # Retain original segments for which it returned no overlapping audio.
             retained = [
@@ -423,30 +513,210 @@ class RealtimeSession:
         result.symptoms, result.symptom_provider, result.analysis, result.rag = [], None, None, None
         result.local_questions = []
         result.manual_grounded = False
-        if result.transcript.text and self.settings.rag_enabled:
+        if result.transcript.text and self.settings.rag_enabled and not self.split_analysis:
             await self.service.prepare_rag(result, semantic=False)
         self.cumulative = result.model_copy(deep=True)
         self.windows_processed += 1
         window = {"start": 0, "end": len(self.raw_pcm) / BYTES_PER_SECOND}
         await self.send_update("audio", self.windows_processed, window, result)
         if result.transcript.text:
-            self.enqueue_latest(self.symptom_queue, (self.windows_processed, window, result))
+            self.enqueue_symptoms(self.windows_processed, window, result)
 
     async def process_symptoms(self):
+        window_cache = {}
         while True:
             item = await self.symptom_queue.get()
             if item is None:
-                await self.analysis_queue.put(None)
+                if self.split_analysis:
+                    self.symptoms_finished.set()
+                else:
+                    await self.analysis_queue.put(None)
                 return
             sequence, window, result = item
             try:
-                result = await self.service.classify(result)
+                options = (
+                    {"prepare_rag": False, "window_cache": window_cache}
+                    if self.split_analysis
+                    else {}
+                )
+                result = await self.service.classify(result, **options)
             except ServiceError as exc:
                 await self.send_update("symptoms", sequence, window, result, exc.body()["error"])
             else:
                 if result.symptom_provider:
+                    if self.split_analysis:
+                        self.latest_symptoms = (self.transcript_key(result), result)
                     await self.send_update("symptoms", sequence, window, result)
+            if not self.split_analysis:
+                self.enqueue_latest(self.analysis_queue, (sequence, window, result))
+
+    def attach_latest_symptoms(self, result):
+        if self.latest_symptoms and self.latest_symptoms[0] == self.transcript_key(result):
+            classified = self.latest_symptoms[1]
+            result.symptoms = classified.symptoms
+            result.symptom_provider = classified.symptom_provider
+            if result.analysis is not None:
+                result.analysis.symptoms = classified.symptoms
+
+    async def process_live_speakers(self):
+        while (audio := await self.speaker_queue.get()) is not None:
+            try:
+                spans = await run_in_threadpool(
+                    self.service.diarizer.diarize, audio, self.speaker_state
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Optional realtime speaker analysis failed (type=%s)", type(exc).__name__
+                )
+                continue
+            if not spans or not self.cumulative:
+                continue
+            if any(span.end > audio.duration_seconds + 0.01 for span in spans):
+                continue
+            current = self.cumulative
+            offset = audio.start_seconds
+            speakers = current.speakers.model_copy(
+                update={
+                    "available": True,
+                    "provider": self.service.diarizer.name,
+                    "segments": current.speakers.segments
+                    + [
+                        span.model_copy(
+                            update={"start": span.start + offset, "end": span.end + offset}
+                        )
+                        for span in spans
+                    ],
+                }
+            )
+            segments = current.transcript.segments.copy()
+            for index, segment in enumerate(segments):
+                if segment.end > offset and segment.start < offset + audio.duration_seconds:
+                    segment = segment.model_copy()
+                    assign_speaker(segment, speakers.segments, True)
+                    segments[index] = segment
+            transcript = current.transcript.model_copy(
+                update={"segments": segments, "diarization_available": True}
+            )
+            self.cumulative = current.model_copy(
+                update={"transcript": transcript, "speakers": speakers}
+            )
+            await self.send_update(
+                "transcript",
+                self.windows_processed,
+                {"start": offset, "end": transcript.duration_seconds},
+                self.cumulative,
+            )
+
+    async def process_split_speakers(self):
+        try:
+            await self.process_live_speakers()
+        finally:
+            self.speakers_finished.set()
+
+    async def process_live_rules(self):
+        last_warning = (False, None)
+        while (item := await self.rules_queue.get()) is not None:
+            sequence, window, snapshot = item
+            result = snapshot.model_copy()
+            self.attach_latest_symptoms(result)
+            await self.service.prepare_rag(result, semantic=False)
+            if result.rag is None or self.recording_stopped.is_set():
+                continue
+            warning = (result.rag.requires_immediate_operator_review, result.rag.manual_urgency)
+            if warning != last_warning:
+                last_warning = warning
+                await self.send_update("audio", sequence, window, result)
             self.enqueue_latest(self.analysis_queue, (sequence, window, result))
+
+    async def run_split_analysis(self, snapshot, mode):
+        result = snapshot.model_copy()
+        if self.cumulative and self.transcript_key(result) == self.transcript_key(self.cumulative):
+            if result.transcript is not self.cumulative.transcript:
+                result.rag = None
+            result.transcript = self.cumulative.transcript
+            result.speakers = self.cumulative.speakers
+        self.attach_latest_symptoms(result)
+        try:
+            if result.rag is None:
+                await self.service.prepare_rag(result, semantic=False)
+            return await asyncio.wait_for(
+                self.service.complete(result, semantic=False, mode=mode),
+                timeout=self.settings.realtime_analysis_timeout_seconds,
+            ), None
+        except asyncio.TimeoutError:
+            error = {
+                "code": "REALTIME_ANALYSIS_TIMEOUT",
+                "message": "실시간 분석 대기 시간을 초과했습니다.",
+            }
+        except ServiceError as exc:
+            error = exc.body()["error"]
+        except Exception as exc:
+            logger.warning("Optional realtime %s failed (type=%s)", mode, type(exc).__name__)
+            error = {
+                "code": "REALTIME_ANALYSIS_FAILED",
+                "message": "보조 분석을 완료하지 못했습니다.",
+            }
+        result.status = "unavailable"
+        if result.rag:
+            result.rag.llm_status = "unavailable"
+            result.rag.llm_error_code = error["code"]
+            if mode == "questions":
+                result.rag.questions_status = "unavailable"
+            else:
+                result.rag.summary_provider = "unavailable"
+        return result, error
+
+    async def process_live_questions(self):
+        while not self.recording_stopped.is_set():
+            sequence, window, snapshot = await self.analysis_queue.get()
+            if self.recording_stopped.is_set():
+                return
+            result, error = await self.run_split_analysis(snapshot, "questions")
+            if self.cumulative and result.transcript.revision < self.cumulative.transcript.revision:
+                continue
+            if result.rag:
+                self.latest_questions = (self.transcript_key(result), result.rag)
+            self.attach_latest_symptoms(result)
+            await self.send_update("analysis", sequence, window, result, error)
+
+    async def process_split_analyses(self):
+        questions_task = asyncio.create_task(self.process_live_questions())
+        try:
+            await self.recording_stopped.wait()
+        finally:
+            questions_task.cancel()
+            await asyncio.gather(questions_task, return_exceptions=True)
+        await self.transcription_finished.wait()
+        await self.speakers_finished.wait()
+        if not self.cumulative or not self.service.conversation(self.cumulative):
+            return
+        result, error = await self.run_split_analysis(self.cumulative, "summary")
+        if result.rag and result.rag.summary and self.latest_questions:
+            (earlier_text, _), earlier = self.latest_questions
+            final_text = result.transcript.text
+            questions = []
+            if final_text == earlier_text or final_text.startswith(earlier_text + " "):
+                questions = [
+                    q
+                    for q in earlier.for_client().questions
+                    if not field_answered(q.field, q.source_excerpt, result.rag.state)
+                    and (
+                        not result.rag.requires_immediate_operator_review
+                        or q.field in {"location", "callback"}
+                    )
+                ]
+            result.rag.questions = questions
+            if questions:
+                result.rag.questions_status = "completed"
+            result.local_questions = [
+                Question(question=q.question, purpose=q.reason) for q in questions
+            ]
+            if result.analysis:
+                result.analysis.recommended_questions = result.local_questions
+        await self.symptoms_finished.wait()
+        self.attach_latest_symptoms(result)
+        window = {"start": 0, "end": self.total_bytes / BYTES_PER_SECOND}
+        await self.send_update("analysis", self.windows_processed, window, result, error)
 
     async def process_analyses(self):
         loop = asyncio.get_running_loop()

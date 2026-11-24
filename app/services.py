@@ -79,6 +79,15 @@ class AnalysisService:
             and realtime_model != settings.whisper_model
         ):
             self.realtime_transcriber = WhisperTranscriber(settings, realtime_model)
+        repair_model = settings.whisper_repair_model or settings.whisper_model
+        self.reviewer = next(
+            (
+                model
+                for model in (self.transcriber, self.realtime_transcriber)
+                if isinstance(model, WhisperTranscriber) and model.model_name == repair_model
+            ),
+            None,
+        ) or WhisperTranscriber(settings, repair_model)
         diarizer_default = Wav2Vec2Diarizer if settings.speaker_model_path else SpeakerModel
         self.diarizer = provider(diarizer, settings.diarizer_factory, diarizer_default)
         classifier_default = KoElectraClassifier if settings.symptom_model_path else SymptomModel
@@ -92,10 +101,16 @@ class AnalysisService:
         models = []
         if isinstance(self.realtime_transcriber, WhisperTranscriber):
             models.append(self.realtime_transcriber)
-        if isinstance(self.diarizer, Wav2Vec2Diarizer):
-            models.append(self.diarizer)
         if isinstance(self.classifier, KoElectraClassifier):
             models.append(self.classifier)
+        if isinstance(self.diarizer, Wav2Vec2Diarizer):
+            models.append(self.diarizer)
+        if (
+            self.settings.realtime_review_enabled
+            and isinstance(self.realtime_transcriber, WhisperTranscriber)
+            and self.reviewer not in models
+        ):
+            models.append(self.reviewer)
         for model in models:
             try:
                 await run_in_threadpool(model.warmup)
@@ -132,8 +147,10 @@ class AnalysisService:
         *,
         realtime: bool = False,
         stt_context: bytes = b"",
+        stt_catching_up: bool = False,
         committed_end: float = 0.0,
         on_transcript: Callable[[AnalysisResponse], Awaitable[None]] | None = None,
+        defer_diarization: bool = False,
     ) -> AnalysisResponse:
         transcriber = self.realtime_transcriber if realtime else self.transcriber
         context_seconds = 0.0
@@ -153,9 +170,14 @@ class AnalysisService:
                     word_cutoff=cutoff,
                     context_samples=len(stt_context) // 2,
                     realtime=True,
+                    beam_size=1 if stt_catching_up else None,
                 )
             else:
                 stt = run_in_threadpool(transcriber.transcribe, audio, language)
+            if defer_diarization:
+                return self._audio_result(
+                    await stt, None, audio, context_seconds, pending_speakers=True
+                )
             diarization = asyncio.create_task(
                 run_in_threadpool(self.diarizer.diarize, audio, speaker_state)
             )
@@ -217,24 +239,33 @@ class AnalysisService:
             warnings=warnings,
         )
 
-    async def classify(self, result: AnalysisResponse) -> AnalysisResponse:
+    async def classify(
+        self, result: AnalysisResponse, *, prepare_rag=True, window_cache=None
+    ) -> AnalysisResponse:
         text = trusted_text(result.transcript)
         if text:
             async with self.slot(self._classifier_slots):
-                symptoms = await run_in_threadpool(self.classifier.predict, text)
+                options = (
+                    {"window_cache": window_cache}
+                    if window_cache is not None and isinstance(self.classifier, KoElectraClassifier)
+                    else {}
+                )
+                symptoms = await run_in_threadpool(self.classifier.predict, text, **options)
             if symptoms is not None:
                 result.symptoms = symptoms
                 result.symptom_provider = self.classifier.name
-        if self.settings.rag_enabled:
+        if prepare_rag and self.settings.rag_enabled:
             await self.prepare_rag(result, semantic=False)
         return result
 
     async def recheck_audio(self, audio, language, *, word_cutoff, end_cutoff):
-        model = self.settings.whisper_repair_model or self.settings.whisper_model
-        reviewer = WhisperTranscriber(self.settings, model)
         async with self.slot():
             return await run_in_threadpool(
-                reviewer.transcribe, audio, language, word_cutoff=word_cutoff, end_cutoff=end_cutoff
+                self.reviewer.transcribe,
+                audio,
+                language,
+                word_cutoff=word_cutoff,
+                end_cutoff=end_cutoff,
             )
 
     @staticmethod
@@ -255,14 +286,10 @@ class AnalysisService:
         result.rag = await run_in_threadpool(
             self.rag.recommend, turns, result.symptoms, semantic=semantic
         )
-        result.manual_grounded = bool(result.rag.questions)
-        result.local_questions = [
-            Question(question=q.question, purpose=q.reason) for q in result.rag.questions
-        ]
         return result
 
     async def complete(
-        self, result: AnalysisResponse, *, semantic: bool = True
+        self, result: AnalysisResponse, *, semantic: bool = True, mode="combined"
     ) -> AnalysisResponse:
         if not self.settings.rag_enabled and (
             self.settings.rag_llm_provider == "disabled"
@@ -278,9 +305,11 @@ class AnalysisService:
                 await self.prepare_rag(result, semantic=semantic)
             if result.rag is not None:
                 if semantic or self.settings.rag_llm_provider != "disabled":
+                    options = {"mode": mode} if mode != "combined" else {}
                     result.rag = await self.rag.refine(
-                        self.conversation(result), result.rag, result.symptoms
+                        self.conversation(result), result.rag, result.symptoms, **options
                     )
+                result.rag = result.rag.for_client()
                 result.manual_grounded = bool(result.rag.questions)
                 result.local_questions = [
                     Question(question=q.question, purpose=q.reason) for q in result.rag.questions
@@ -290,14 +319,18 @@ class AnalysisService:
                     result.analysis = None
                     result.analysis_provider = "manual-rag"
                     return result
-                result.analysis = Situation(
-                    summary=result.rag.summary or "LLM 요약을 아직 생성하지 못했습니다.",
-                    symptoms=result.symptoms,
-                    urgency={
-                        "level": result.rag.urgency.level,
-                        "reason": result.rag.urgency.reason,
-                    },
-                    recommended_questions=result.local_questions,
+                result.analysis = (
+                    Situation(
+                        summary=result.rag.summary,
+                        symptoms=result.symptoms,
+                        urgency={
+                            "level": result.rag.urgency.level,
+                            "reason": result.rag.urgency.reason,
+                        },
+                        recommended_questions=result.local_questions,
+                    )
+                    if result.rag.summary
+                    else None
                 )
             result.status = (
                 "completed"

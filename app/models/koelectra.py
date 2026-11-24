@@ -2,6 +2,7 @@ from threading import Lock
 
 from app.config import ROOT, Settings
 from app.errors import ServiceError
+from app.models import torch_model_load_lock
 from app.schemas import Symptom, SymptomCode
 
 LABEL_CODES: dict[str, SymptomCode] = {
@@ -27,7 +28,8 @@ class KoElectraClassifier:
     def _load(self):
         with self._load_lock:
             if self._runtime is None:
-                self._runtime = self._load_checkpoint()
+                with torch_model_load_lock:
+                    self._runtime = self._load_checkpoint()
             return self._runtime
 
     def _load_checkpoint(self):
@@ -85,8 +87,10 @@ class KoElectraClassifier:
     def warmup(self):
         self._load()
 
-    def predict(self, text: str) -> list[Symptom]:
+    def predict(self, text: str, *, window_cache=None) -> list[Symptom]:
         if not text.strip():
+            if window_cache is not None:
+                window_cache.clear()
             return []
         model, tokenizer, labels, max_length, stride = self._load()
 
@@ -102,17 +106,39 @@ class KoElectraClassifier:
                 padding=True,
                 return_tensors="pt",
             )
-            logits = []
+            keys = (
+                [
+                    tuple(ids[mask.bool()].tolist())
+                    for ids, mask in zip(
+                        windows["input_ids"], windows["attention_mask"], strict=True
+                    )
+                ]
+                if window_cache is not None
+                else list(range(len(windows["input_ids"])))
+            )
+            logits = {
+                key: window_cache[key]
+                for key in keys
+                if window_cache is not None and key in window_cache
+            }
+            pending = [index for index, key in enumerate(keys) if key not in logits]
             with torch.inference_mode():
-                for offset in range(0, len(windows["input_ids"]), 4):
+                for offset in range(0, len(pending), 4):
+                    indices = pending[offset : offset + 4]
                     inputs = {
-                        key: values[offset : offset + 4]
+                        key: values[indices]
                         for key, values in windows.items()
                         if key != "overflow_to_sample_mapping"
                     }
                     cls = model["encoder"](**inputs).last_hidden_state[:, 0]
-                    logits.append(model["head"](cls).amax(dim=0))
-                scores = torch.stack(logits).amax(dim=0).sigmoid().tolist()
+                    logits.update(
+                        (keys[index], row.detach())
+                        for index, row in zip(indices, model["head"](cls), strict=True)
+                    )
+                scores = torch.stack(list(logits.values())).amax(dim=0).sigmoid().tolist()
+            if window_cache is not None:
+                window_cache.clear()
+                window_cache.update(logits)
         except Exception as exc:
             raise ServiceError(503, "SYMPTOM_MODEL_FAILED", "증상 분류에 실패했습니다.") from exc
         return [

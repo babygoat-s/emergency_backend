@@ -5,8 +5,10 @@ from time import monotonic
 
 from app.rag.enrichment import numbers_supported, question_text, reported_text
 from app.rag.question_bank import (
+    SYMPTOM_PRESENCE,
     active_binding,
     contextual_question,
+    estimate_question_is_open,
     local_question,
     matches_question_focus,
     relevant_question,
@@ -61,6 +63,33 @@ def field_answered(field, source_text, state):
     return not (field == "breathing" and "정상" in source_text and fact.value == "present")
 
 
+def estimated_questions(store, turns, symptoms, confirmed_codes):
+    protocols = {c.source.protocol_id: c for c in store.chunks if c.kind == "protocol"}
+    questions = []
+    for symptom in sorted(symptoms, key=lambda item: item.score or 0, reverse=True):
+        code = symptom.code
+        anchor = protocols.get(SYMPTOM_PROTOCOLS.get(code))
+        field = f"{SYMPTOM_PRESENCE}{code}"
+        if not anchor or not estimate_question_is_open(field, turns, confirmed_codes):
+            continue
+        excerpt = next(
+            (line.strip() for line in anchor.text.splitlines() if anchor.protocol_name in line),
+            anchor.protocol_name,
+        )[:220]
+        questions.append(
+            Recommendation(
+                question=f"환자분에게 {symptom.label} 증상이 있나요?",
+                reason="추정 모델이 감지한 미확인 증상의 동반 여부를 확인합니다.",
+                related_symptom=symptom.label,
+                priority=3,
+                source=anchor.source.model_copy(update={"question_id": f"{anchor.id}:{code}"}),
+                source_excerpt=excerpt,
+                field=field,
+            )
+        )
+    return questions
+
+
 class RagEngine:
     def __init__(self, settings):
         self.settings = settings
@@ -77,7 +106,9 @@ class RagEngine:
     def warmup(self):
         self.store()._load()
 
-    def recommend(self, turns, symptoms=(), previous=None, *, semantic=True, state=None):
+    def recommend(
+        self, turns, symptoms=(), previous=None, *, semantic=True, state=None, estimates=()
+    ):
         urgency = UrgencyProposal()
         if (
             self.settings.rag_llm_provider == "openai_compatible"
@@ -105,6 +136,9 @@ class RagEngine:
                 f"(PDF {reference.source.pdf_page}쪽)"
             )
         protocols = set(state.protocol_ids)
+        confirmed_codes = {symptom.code for symptom in symptoms}
+        duplicates = confirmed_codes.intersection(symptom.code for symptom in estimates)
+        symptoms = [symptom for symptom in symptoms if symptom.code not in duplicates]
         for symptom in symptoms:
             protocol = SYMPTOM_PROTOCOLS.get(symptom.code)
             if protocol:
@@ -213,6 +247,11 @@ class RagEngine:
         candidates.sort(key=rank)
         selected = []
         used_fields = set()
+        screening = [] if urgent else estimated_questions(store, turns, estimates, confirmed_codes)
+        if "nausea_vomiting" in duplicates or any(
+            q.field == f"{SYMPTOM_PRESENCE}nausea_vomiting" for q in screening
+        ):
+            used_fields.add("vomiting")
         for chunk, binding in candidates:
             if binding["field"] in used_fields:
                 continue
@@ -239,6 +278,7 @@ class RagEngine:
             )
             if len(selected) >= 18:
                 break
+        selected[2:2] = screening
         classifications = [
             Reference(text=c.text, source=c.source, category=c.source_category)
             for c in store.chunks
@@ -306,6 +346,11 @@ class RagEngine:
         primaries = {q.source.question_id for q in candidates}
         context = {}
         sources = {}
+        for candidate in candidates:
+            if candidate.field.startswith(SYMPTOM_PRESENCE):
+                key = candidate.source.question_id
+                context[key] = {"text": candidate.source_excerpt, "field": candidate.field}
+                sources[key] = candidate.source
         for chunk in self.store().questions:
             if chunk.source.protocol_id not in {"INTRO", *result.state.protocol_ids}:
                 continue
@@ -331,7 +376,7 @@ class RagEngine:
             sources[chunk.source.question_id] = chunk.source
         return context, sources
 
-    async def refine(self, turns, result, symptoms=(), *, mode="combined"):
+    async def refine(self, turns, result, symptoms=(), *, mode="combined", estimates=()):
         if self.settings.rag_llm_provider == "disabled":
             from starlette.concurrency import run_in_threadpool
 
@@ -341,7 +386,11 @@ class RagEngine:
                 and result.retrieval.get("mode") != "chroma_semantic_and_metadata"
             ):
                 return await run_in_threadpool(
-                    self.recommend, turns, symptoms, state=result.state.model_copy(deep=True)
+                    self.recommend,
+                    turns,
+                    symptoms,
+                    state=result.state.model_copy(deep=True),
+                    estimates=estimates,
                 )
             result.llm_status = "disabled"
             result.summary_provider = "disabled"
@@ -362,7 +411,11 @@ class RagEngine:
                 and result.retrieval.get("mode") != "chroma_semantic_and_metadata"
             ):
                 result = await run_in_threadpool(
-                    self.recommend, turns, symptoms, state=result.state.model_copy(deep=True)
+                    self.recommend,
+                    turns,
+                    symptoms,
+                    state=result.state.model_copy(deep=True),
+                    estimates=estimates,
                 )
             if mode == "questions" and (
                 result.requires_immediate_operator_review or not result.questions
@@ -386,7 +439,9 @@ class RagEngine:
         refined = (
             result.model_copy(deep=True)
             if compact or result.status == "index_unavailable"
-            else self.recommend(turns, symptoms, semantic=False, state=enriched.state)
+            else self.recommend(
+                turns, symptoms, semantic=False, state=enriched.state, estimates=estimates
+            )
         )
         refined.retrieval = result.retrieval
         refined.llm_status = enriched.status

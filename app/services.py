@@ -21,6 +21,7 @@ from app.providers.base import (
 from app.providers.gemini import GeminiAnalyzer
 from app.providers.whisper import WhisperTranscriber
 from app.rag.engine import RagEngine
+from app.rag.enrichment import report_statements, reported_text
 from app.rag.schemas import Turn
 from app.recognition_quality import trusted_text
 from app.schemas import (
@@ -92,10 +93,22 @@ class AnalysisService:
         self.diarizer = provider(diarizer, settings.diarizer_factory, diarizer_default)
         classifier_default = KoElectraClassifier if settings.symptom_model_path else SymptomModel
         self.classifier = provider(classifier, settings.classifier_factory, classifier_default)
+        self.symptom_estimator = (
+            KoElectraClassifier(
+                settings.model_copy(
+                    update={
+                        "symptom_model_path": settings.symptom_estimator_model_path,
+                    }
+                )
+            )
+            if settings.symptom_estimator_model_path
+            else None
+        )
         self.analyzer = analyzer or GeminiAnalyzer(settings)
         self.rag = RagEngine(settings)
         self._audio_slots = asyncio.Semaphore(settings.max_concurrent_inferences)
         self._classifier_slots = asyncio.Semaphore(1)
+        self._estimator_slots = asyncio.Semaphore(1)
 
     async def warm_models(self):
         models = []
@@ -105,6 +118,8 @@ class AnalysisService:
             models.append(self.classifier)
         if isinstance(self.diarizer, Wav2Vec2Diarizer):
             models.append(self.diarizer)
+        if self.symptom_estimator and self.settings.rag_llm_provider != "disabled":
+            models.append(self.symptom_estimator)
         if (
             self.settings.realtime_review_enabled
             and isinstance(self.realtime_transcriber, WhisperTranscriber)
@@ -245,11 +260,16 @@ class AnalysisService:
         text = trusted_text(result.transcript)
         if text:
             async with self.slot(self._classifier_slots):
-                options = (
-                    {"window_cache": window_cache}
-                    if window_cache is not None and isinstance(self.classifier, KoElectraClassifier)
-                    else {}
-                )
+                options = {}
+                if window_cache is not None and type(self.classifier) is KoElectraClassifier:
+                    options = {
+                        "window_cache": window_cache,
+                        "utterances": [
+                            statement
+                            for turn in self.conversation(result)
+                            for statement in report_statements(turn.text, turn.speaker)
+                        ],
+                    }
                 symptoms = await run_in_threadpool(self.classifier.predict, text, **options)
             if symptoms is not None:
                 result.symptoms = symptoms
@@ -279,17 +299,52 @@ class AnalysisService:
             ]
         return [Turn(id="0", text=result.transcript.text)] if result.transcript.text else []
 
-    async def prepare_rag(self, result, *, semantic=True):
+    async def estimate_question_symptoms(self, turns, *, window_cache=None):
+        if self.symptom_estimator is None or self.settings.rag_llm_provider == "disabled":
+            return []
+        text = reported_text(turns)
+        if not text:
+            return []
+        try:
+            async with self.slot(self._estimator_slots):
+                options = {"window_cache": window_cache} if window_cache is not None else {}
+                return await run_in_threadpool(self.symptom_estimator.predict, text, **options)
+        except ServiceError as exc:
+            logger.warning("Question symptom estimation unavailable (%s)", exc.code)
+            return []
+
+    async def text_question_symptoms(self, turns):
+        if self.symptom_estimator is None or self.settings.rag_llm_provider == "disabled":
+            return [], []
+        text = reported_text(turns)
+        if not text:
+            return [], []
+        try:
+            async with self.slot(self._classifier_slots):
+                symptoms = await run_in_threadpool(self.classifier.predict, text)
+        except ServiceError as exc:
+            logger.warning("Question symptom classification unavailable (%s)", exc.code)
+            return [], []
+        if symptoms is None:
+            return [], []
+        return symptoms, await self.estimate_question_symptoms(turns)
+
+    async def prepare_rag(self, result, *, semantic=True, estimates=()):
         turns = self.conversation(result)
         if not turns:
             return result
         result.rag = await run_in_threadpool(
-            self.rag.recommend, turns, result.symptoms, semantic=semantic
+            self.rag.recommend, turns, result.symptoms, semantic=semantic, estimates=estimates
         )
         return result
 
     async def complete(
-        self, result: AnalysisResponse, *, semantic: bool = True, mode="combined"
+        self,
+        result: AnalysisResponse,
+        *,
+        semantic: bool = True,
+        mode="combined",
+        estimate_window_cache=None,
     ) -> AnalysisResponse:
         if not self.settings.rag_enabled and (
             self.settings.rag_llm_provider == "disabled"
@@ -301,13 +356,29 @@ class AnalysisService:
             return result
         if self.settings.rag_enabled:
             result = result.model_copy(deep=True)
+            turns = self.conversation(result)
             if result.rag is None:
                 await self.prepare_rag(result, semantic=semantic)
+            estimates = []
+            if (
+                mode != "summary"
+                and result.symptom_provider
+                and result.rag
+                and not result.rag.requires_immediate_operator_review
+                and result.rag.status != "index_unavailable"
+            ):
+                estimates = await self.estimate_question_symptoms(
+                    turns, window_cache=estimate_window_cache
+                )
+                if estimates:
+                    await self.prepare_rag(result, semantic=semantic, estimates=estimates)
             if result.rag is not None:
                 if semantic or self.settings.rag_llm_provider != "disabled":
                     options = {"mode": mode} if mode != "combined" else {}
+                    if estimates:
+                        options["estimates"] = estimates
                     result.rag = await self.rag.refine(
-                        self.conversation(result), result.rag, result.symptoms, **options
+                        turns, result.rag, result.symptoms, **options
                     )
                 result.rag = result.rag.for_client()
                 result.manual_grounded = bool(result.rag.questions)

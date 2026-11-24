@@ -15,7 +15,7 @@ from app.models.koelectra import KoElectraClassifier
 from app.models.placeholders import SpeakerModel, SpeechModel, SymptomModel
 from app.providers.whisper import WhisperTranscriber
 from app.realtime import RealtimeSession
-from app.schemas import StreamStart
+from app.schemas import StreamStart, Symptom, Transcript
 from app.services import AnalysisService
 from tests.conftest import FakeAnalyzer, FakeClassifier, FakeDiarizer, FakeTranscriber
 
@@ -122,6 +122,49 @@ def test_continuous_audio_and_full_updates(backend):
                 "windows_processed": 2,
                 "duration_seconds": 1,
             }
+
+
+def test_realtime_koelectra_keeps_symptoms_from_earlier_utterances(backend):
+    reports = {
+        "호흡곤란이 있어요.": Symptom(code="breathing_difficulty", label="호흡곤란"),
+        "전신쇠약이 있어요.": Symptom(code="general_weakness", label="전신쇠약"),
+        "두통이 있어요.": Symptom(code="headache", label="두통"),
+    }
+    utterances = iter(reports)
+
+    def transcribe(audio, language):
+        text = next(utterances)
+        return Transcript(
+            text=text,
+            provider="test",
+            language=language,
+            segments=[{"start": 0, "end": audio.duration_seconds, "text": text}],
+        )
+
+    def predict(text, *, utterances=(), **_):
+        # Model the regression where one cumulative input only detects the last complaint.
+        parts = utterances or [next(report for report in reversed(reports) if report in text)]
+        return [reports[part] for part in parts]
+
+    classifier = KoElectraClassifier(backend.service.settings)
+    classifier.predict = predict
+    backend.service.classifier = classifier
+    backend.transcriber.transcribe = transcribe
+    expected = []
+    with backend.client.websocket_connect(PATH) as ws:
+        begin(ws)
+        for sequence, symptom in enumerate(reports.values(), 1):
+            expected.append(symptom.code)
+            ws.send_bytes(PCM)
+            while True:
+                event = ws.receive_json()
+                assert event["type"] == "update", event
+                if event["stage"] == "symptoms" and event["sequence"] == sequence:
+                    assert [s["code"] for s in event["data"]["symptoms"]] == expected
+                    break
+        ws.send_json({"type": "finish"})
+        while (event := ws.receive_json())["type"] != "finished":
+            assert event["type"] == "update", event
 
 
 def test_configurable_three_second_window(backend):

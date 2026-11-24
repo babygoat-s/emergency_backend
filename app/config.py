@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     classifier_factory: str = ""
     symptom_model_path: str = ""
     symptom_tokenizer_path: str = ""
+    symptom_estimator_model_path: str = ""
     realtime_window_seconds: float = Field(default=6, ge=0.5, le=10)
     realtime_pause_split: bool = False
     realtime_analysis_timeout_seconds: float = Field(default=25, gt=0, le=120)

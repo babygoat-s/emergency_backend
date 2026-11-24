@@ -10,6 +10,7 @@ from app.audio import BYTES_PER_SECOND, AudioInput
 from app.errors import ServiceError
 from app.providers.whisper import WhisperTranscriber
 from app.rag.engine import field_answered
+from app.rag.question_bank import estimate_question_is_open
 from app.recognition_quality import (
     REVIEW_FAILED,
     REVIEW_WARNING,
@@ -38,6 +39,8 @@ class RealtimeSession:
             and self.settings.rag_llm_provider == "openai_compatible"
             and self.settings.rag_llm_compact_request
         )
+        self.estimate_questions = self.split_analysis and self.service.symptom_estimator is not None
+        self.estimate_window_cache = {}
         self.window_bytes = int(self.settings.realtime_window_seconds * BYTES_PER_SECOND) // 2 * 2
         # Total PCM is already capped by max_audio_seconds in receive_audio.
         # Keep that bounded recording in memory instead of closing the socket
@@ -534,12 +537,9 @@ class RealtimeSession:
                 return
             sequence, window, result = item
             try:
-                options = (
-                    {"prepare_rag": False, "window_cache": window_cache}
-                    if self.split_analysis
-                    else {}
+                result = await self.service.classify(
+                    result, prepare_rag=not self.split_analysis, window_cache=window_cache
                 )
-                result = await self.service.classify(result, **options)
             except ServiceError as exc:
                 await self.send_update("symptoms", sequence, window, result, exc.body()["error"])
             else:
@@ -548,6 +548,8 @@ class RealtimeSession:
                         self.latest_symptoms = (self.transcript_key(result), result)
                     await self.send_update("symptoms", sequence, window, result)
             if not self.split_analysis:
+                self.enqueue_latest(self.analysis_queue, (sequence, window, result))
+            elif self.estimate_questions and not self.recording_stopped.is_set():
                 self.enqueue_latest(self.analysis_queue, (sequence, window, result))
 
     def attach_latest_symptoms(self, result):
@@ -626,7 +628,8 @@ class RealtimeSession:
             if warning != last_warning:
                 last_warning = warning
                 await self.send_update("audio", sequence, window, result)
-            self.enqueue_latest(self.analysis_queue, (sequence, window, result))
+            if not self.estimate_questions:
+                self.enqueue_latest(self.analysis_queue, (sequence, window, result))
 
     async def run_split_analysis(self, snapshot, mode):
         result = snapshot.model_copy()
@@ -639,8 +642,13 @@ class RealtimeSession:
         try:
             if result.rag is None:
                 await self.service.prepare_rag(result, semantic=False)
+            options = (
+                {"estimate_window_cache": self.estimate_window_cache}
+                if mode == "questions" and self.estimate_questions
+                else {}
+            )
             return await asyncio.wait_for(
-                self.service.complete(result, semantic=False, mode=mode),
+                self.service.complete(result, semantic=False, mode=mode, **options),
                 timeout=self.settings.realtime_analysis_timeout_seconds,
             ), None
         except asyncio.TimeoutError:
@@ -675,9 +683,31 @@ class RealtimeSession:
             if self.cumulative and result.transcript.revision < self.cumulative.transcript.revision:
                 continue
             if result.rag:
+                if self.estimate_questions:
+                    current = self.cumulative or result
+                    classified = self.latest_symptoms[1] if self.latest_symptoms else result
+                    confirmed_codes = {s.code for s in classified.symptoms}
+                    turns = self.service.conversation(current)
+                    self.update_questions(
+                        result,
+                        [
+                            q
+                            for q in result.rag.questions
+                            if estimate_question_is_open(q.field, turns, confirmed_codes)
+                        ],
+                    )
                 self.latest_questions = (self.transcript_key(result), result.rag)
             self.attach_latest_symptoms(result)
             await self.send_update("analysis", sequence, window, result, error)
+
+    @staticmethod
+    def update_questions(result, questions):
+        result.rag.questions = questions
+        result.local_questions = [
+            Question(question=q.question, purpose=q.reason) for q in questions
+        ]
+        if result.analysis:
+            result.analysis.recommended_questions = result.local_questions
 
     async def process_split_analyses(self):
         questions_task = asyncio.create_task(self.process_live_questions())
@@ -691,30 +721,28 @@ class RealtimeSession:
         if not self.cumulative or not self.service.conversation(self.cumulative):
             return
         result, error = await self.run_split_analysis(self.cumulative, "summary")
+        await self.symptoms_finished.wait()
+        self.attach_latest_symptoms(result)
         if result.rag and result.rag.summary and self.latest_questions:
             (earlier_text, _), earlier = self.latest_questions
             final_text = result.transcript.text
             questions = []
             if final_text == earlier_text or final_text.startswith(earlier_text + " "):
+                final_turns = self.service.conversation(result)
+                confirmed_codes = {s.code for s in result.symptoms}
                 questions = [
                     q
                     for q in earlier.for_client().questions
                     if not field_answered(q.field, q.source_excerpt, result.rag.state)
+                    and estimate_question_is_open(q.field, final_turns, confirmed_codes)
                     and (
                         not result.rag.requires_immediate_operator_review
                         or q.field in {"location", "callback"}
                     )
                 ]
-            result.rag.questions = questions
+            self.update_questions(result, questions)
             if questions:
                 result.rag.questions_status = "completed"
-            result.local_questions = [
-                Question(question=q.question, purpose=q.reason) for q in questions
-            ]
-            if result.analysis:
-                result.analysis.recommended_questions = result.local_questions
-        await self.symptoms_finished.wait()
-        self.attach_latest_symptoms(result)
         window = {"start": 0, "end": self.total_bytes / BYTES_PER_SECOND}
         await self.send_update("analysis", self.windows_processed, window, result, error)
 

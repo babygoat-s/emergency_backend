@@ -54,6 +54,33 @@ QUESTION_FOCUS = {
     "symptom_onset": r"언제|몇\s*(?:분|시간)",
 }
 
+SYMPTOM_PRESENCE = "symptom_presence:"
+SYMPTOM_WORDS = {
+    "fever": r"고열|발열|체온|열이|열은",
+    "nausea_vomiting": r"구토|오심|구역|메스껍|메스꺼|토(?:해|했|하|한|할)",
+    "headache": r"두통|머리(?:가|도)?\s*(?:아|통증)",
+    "abdominal_pain": r"복통|배(?:가|도)?\s*(?:아|통증)|복부\s*통증",
+    "dizziness": r"어지러|어지럽",
+    "laceration": r"열상|찢어|베인",
+    "general_weakness": r"전신\s*쇠약|(?:기운|힘)이?\s*(?:없|빠)",
+    "breathing_difficulty": (
+        r"호흡\s*곤란|숨이?\s*(?:너무\s*)?(?:차|찬)"
+        r"|(?:숨\s*쉬기|호흡)(?:가|이)?\s*(?:어렵|어려|힘들|힘드)"
+    ),
+}
+
+
+def symptom_already_discussed(code, turns):
+    pattern = SYMPTOM_WORDS.get(code)
+    return pattern is not None and any(re.search(pattern, turn.text) for turn in turns)
+
+
+def estimate_question_is_open(field, turns, confirmed_codes):
+    if not field.startswith(SYMPTOM_PRESENCE):
+        return True
+    code = field.removeprefix(SYMPTOM_PRESENCE)
+    return code not in confirmed_codes and not symptom_already_discussed(code, turns)
+
 
 def reported_protocol(state, protocol):
     fact = state.fields.get(f"protocol:{protocol}", Observation())
@@ -93,6 +120,11 @@ def matches_question_focus(field, text):
     safety_question = bool(re.search(r"안전|위험한\s*(?:곳|상황)", text))
     if safety_question != (field == "scene_safety"):
         return False
+    if field.startswith(SYMPTOM_PRESENCE):
+        pattern = SYMPTOM_WORDS.get(field.removeprefix(SYMPTOM_PRESENCE))
+        return bool(pattern and re.search(pattern, text)) and not re.search(
+            r"언제|얼마나|때문에|있으니|있어서|있다고|(?:몇|\d+)\s*(?:분|시간|일|번)", text
+        )
     return field not in QUESTION_FOCUS or bool(re.search(QUESTION_FOCUS[field], text))
 
 

@@ -82,6 +82,122 @@ def caller(text, id="0"):
     return Turn(id=id, speaker="caller", text=text)
 
 
+def add_headache_protocol(engine):
+    source = engine._store.questions[0].source.model_copy(
+        update={"protocol_id": "P03", "pdf_page": 13, "question_id": None}
+    )
+    engine._store.chunks.append(
+        ManualChunk(
+            id="headache-protocol",
+            source=source,
+            protocol_name="두통",
+            kind="protocol",
+            text="3. 두통\n의식이 또렷합니까?",
+            order=0,
+        )
+    )
+
+
+def test_estimates_are_grounded_questions_without_creating_new_facts(engine):
+    add_headache_protocol(engine)
+    estimate = Symptom(code="headache", label="두통", score=0.98)
+    clear = [caller("아버지가 주저앉았어요.")]
+    result = engine.recommend(clear, semantic=False, estimates=[estimate])
+    assert "protocol:P03" not in result.state.fields
+    question = result.questions[-1]
+    assert question.field == "symptom_presence:headache"
+    assert question.source.pdf_page == 13 and question.source_excerpt == "3. 두통"
+    context, _ = engine.question_context(result)
+    assert context[question.source.question_id]["field"] == question.field
+    assert matches_question_focus(question.field, "환자분은 머리도 아프신가요?")
+    assert not matches_question_focus(question.field, "두통이 언제부터 있으셨나요?")
+    duplicates = engine.recommend(clear, [estimate], semantic=False, estimates=[estimate])
+    assert question.field not in {q.field for q in duplicates.questions}
+    assert "P03" not in duplicates.state.protocol_ids
+    denied = engine.recommend([caller("두통은 없어요.")], semantic=False, estimates=[estimate])
+    assert question.field not in {q.field for q in denied.questions}
+
+
+@pytest.mark.parametrize("confirmed_after_stop", [False, True])
+def test_realtime_estimates_only_feed_grounded_questions(backend, engine, confirmed_after_stop):
+    add_headache_protocol(engine)
+    for settings in (backend.service.settings, engine.settings):
+        settings.rag_enabled = True
+        settings.rag_llm_provider = "openai_compatible"
+        settings.rag_llm_compact_request = True
+    backend.service.rag = engine
+    primary = Symptom(code="nausea_vomiting", label="구토·오심", score=0.9)
+    estimate = Symptom(code="headache", label="두통", score=0.8)
+    seen = []
+
+    def classify(text):
+        if confirmed_after_stop and text.count("쓰러지셨어요") > 1:
+            return [primary, estimate]
+        return [primary]
+
+    def estimate_symptoms(text, **kwargs):
+        seen.append(text)
+        return [primary, estimate]
+
+    backend.service.classifier = SimpleNamespace(name="test-primary", predict=classify)
+    backend.service.symptom_estimator = SimpleNamespace(predict=estimate_symptoms)
+
+    async def enrich(turns, result, context, *, questions_only=False, summary_only=False):
+        if summary_only:
+            assert not context
+            return Enrichment(
+                state=result.state, status="completed", summary="쓰러짐을 보고했습니다."
+            )
+        assert questions_only
+        question = next(q for q in result.questions if q.field == "symptom_presence:headache")
+        assert {q.field for q in result.questions if q.field.startswith("symptom_presence:")} == {
+            question.field
+        }
+        assert context[question.source.question_id]["text"] == "3. 두통"
+        return Enrichment(
+            state=result.state,
+            status="completed",
+            questions=[
+                QuestionDraft(
+                    candidate_id=question.source.question_id,
+                    question="쓰러지신 환자분에게 두통도 있나요?",
+                    reason="동반 증상 확인",
+                    source_ids=[question.source.question_id],
+                )
+            ],
+        )
+
+    engine._llm = SimpleNamespace(enrich=enrich, close=AsyncMock())
+    frame = b"\x01\x00" * 8000
+    with backend.client.websocket_connect("/api/v1/analysis/realtime") as socket:
+        socket.send_json({"type": "start"})
+        assert socket.receive_json()["type"] == "ready"
+        socket.send_bytes(frame)
+        saw_symptoms = False
+        while True:
+            event = socket.receive_json()
+            assert event["type"] == "update", event
+            if event["stage"] == "symptoms":
+                assert [s["code"] for s in event["data"]["symptoms"]] == [primary.code]
+                saw_symptoms = True
+            if event["stage"] == "analysis":
+                live = event["data"]
+                break
+        assert saw_symptoms
+        assert [s["code"] for s in live["symptoms"]] == [primary.code]
+        assert live["rag"]["questions"][0]["field"] == "symptom_presence:headache"
+        socket.send_bytes(frame[: len(frame) // 2])
+        socket.send_json({"type": "finish"})
+        final = None
+        while (event := socket.receive_json())["type"] != "finished":
+            assert event["type"] == "update", event
+            if event["stage"] == "analysis":
+                final = event["data"]
+    assert final["rag"]["summary"]
+    assert final["rag"]["questions"] == ([] if confirmed_after_stop else live["rag"]["questions"])
+    assert len(seen) == 1
+
+
 def test_confirmed_fields_are_not_repeated_and_negation_is_clause_scoped(engine):
     result = engine.recommend(
         [

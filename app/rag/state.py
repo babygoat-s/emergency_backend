@@ -27,6 +27,10 @@ BASE_FIELDS = [
     "paralysis",
     "sensory_change",
     "symptom_onset",
+    "controlled_laceration",
+    "medication_exposure",
+    "alcohol_exposure",
+    "repeated_syncope",
 ]
 FACT_PATTERNS = {
     "speech_difficulty": [
@@ -47,10 +51,15 @@ FACT_PATTERNS = {
         ("alert", r"의식(?:이|은)?\s*(?:있|또렷|명료)|정신(?:이|은)?\s*또렷"),
     ],
     "breathing": [
-        ("absent", r"숨(?:을|은|도)?\s*(?:안|못)\s*쉬|호흡(?:이|은)?\s*없|숨을 쉬지 않"),
+        (
+            "absent",
+            r"숨(?:을|은|도)?\s*(?:안|못)\s*쉬|호흡(?:이|은)?\s*없"
+            r"|숨(?:을|은|도)?\s*(?:전혀\s*)?쉬지 않",
+        ),
         (
             "abnormal",
-            r"호흡(?:이|은)?\s*비정상|숨(?:이|은)?\s*차|숨.*(?:쉬기|쉬기가).*어려|호흡곤란",
+            r"호흡(?:이|은)?\s*비정상|숨(?:이|은)?\s*차|숨.*쉬기.*(?:어려|힘들)"
+            r"|숨.*(?:못\s*쉬겠|잘\s*못\s*쉬)|호흡곤란",
         ),
         ("normal", r"호흡(?:이|은)?\s*정상|숨(?:을|은)?\s*(?:잘|정상적으로)\s*쉬"),
         ("present", r"숨(?:을|은)?\s*쉬|호흡(?:이|은)?\s*있"),
@@ -70,13 +79,33 @@ FACT_PATTERNS = {
     "seizure": [("no", r"경련.*없|경련.*안 해"), ("yes", r"경련.*(?:하|했|있)|발작.*(?:하|했|있)")],
     "syncope": [("no", r"실신.*없|실신.*안 했"), ("yes", r"실신.*(?:했|있)")],
     "chest_pain": [
-        ("no", r"가슴.*안 아|흉통.*없|가슴 통증.*없"),
+        ("no", r"가슴.{0,25}(?:안 아|아프지(?:는)?\s*않)|흉통.*없|가슴 통증.*없"),
         ("yes", r"가슴.*아프|가슴이 아|흉통.*있|가슴 통증.*있"),
     ],
     "severe_bleeding": [("yes", r"피가.*(?:많이|계속)|출혈.*심"), ("no", r"출혈.*없|피.*안 나")],
     "pregnancy": [("no", r"임신.*아니|임신.*안 했"), ("yes", r"임신.*(?:중|했|맞)")],
+    "controlled_laceration": [
+        ("no", r"(?:열상|찢어진).*(?:지혈.*(?:안|못|되지 않)|피.*계속)"),
+        ("yes", r"(?:열상|찢어진 상처).*(?:지혈됐|지혈되었|피가 멈췄)"),
+    ],
+    "medication_exposure": [
+        ("no", r"약.{0,14}(?:안 먹|먹지 않|복용하지 않)"),
+        ("yes", r"약(?:물)?(?:을|은)?\s*(?:(?:너무|많이|과량)\s*)?(?:먹었|먹고|복용했|복용한)"),
+    ],
+    "alcohol_exposure": [
+        ("no", r"술.{0,14}(?:안 마|마시지 않|먹지 않)"),
+        ("yes", r"술을?\s*(?:(?:많이|너무)\s*)?(?:마셨|마시고|먹었|먹고)"),
+    ],
+    "repeated_syncope": [
+        ("no", r"실신.*없|실신하지 않"),
+        ("yes", r"(?:[2-9]|두|세|네|여러)\s*(?:번|차례).{0,12}(?:실신|의식을 잃)"),
+    ],
 }
 UNCERTAINTY = re.compile(r"모르|불확실|같아|같습|아마|확인.*(?:안|못)|잘 안 보")
+ABSENCE_EXCEPTION = re.compile(
+    r"없었(?:던|지만|는데|다가)|없(?:으면|을 때)|쉬(?:면|는다면|겠)|않(?:으면|을 때|다가)"
+    r"|(?:없는|쉬는|않는)\s*(?:건|것은|상태는)\s*아니"
+)
 
 
 def apply_observation(
@@ -163,7 +192,7 @@ def update_state(
         pending_field = None
         clauses = [
             part.strip()
-            for part in re.split(r"[.!?,\n]|(?<=고)\s+|(?<=며)\s+", text)
+            for part in re.split(r"[.!?,\n]|(?<=고)\s+|(?<=며)\s+|(?<=는데)\s+(?=지금|현재)", text)
             if part.strip()
         ]
         for clause in clauses:
@@ -171,12 +200,16 @@ def update_state(
                 continue
             for field, patterns in FACT_PATTERNS.items():
                 for value, pattern in patterns:
+                    if value == "absent" and ABSENCE_EXCEPTION.search(clause):
+                        continue
                     if re.search(pattern, clause):
                         record(field, value, clause)
                         break
             for protocol, aliases in PROTOCOL_ALIASES.items():
                 if any(alias in clause for alias in aliases):
-                    if not re.search(r"안 아|없|아니|안 해|하지 않", clause):
+                    if protocol == "P12" and re.search(r"쓰러질|실신할|잃을\s*뻔|잃지", clause):
+                        continue
+                    if not re.search(r"안 아|없|아니|안 해|하지 않|아프지(?:는)?\s*않", clause):
                         protocols.add(protocol)
                         record("chief_complaint", text[:500], clause)
                         record(f"protocol:{protocol}", "yes", clause)

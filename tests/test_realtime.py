@@ -361,7 +361,7 @@ def test_gemini_failure_keeps_transcription_alive(backend, status, code):
             ws.send_bytes(PCM)
             audio = ws.receive_json()
             assert audio["stage"] == "audio"
-            assert len(audio["data"]["local_questions"]) == 3
+            assert audio["data"]["local_questions"] == []
             event = ws.receive_json()
             assert event["data"]["status"] == "unavailable"
             assert event["data"]["analysis"] is None

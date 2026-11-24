@@ -6,6 +6,7 @@ from threading import Lock
 from app.audio import SAMPLE_RATE, AudioInput
 from app.config import ROOT, Settings
 from app.errors import ServiceError
+from app.recognition_quality import REVIEW_WARNING, runaway_segment_indices
 from app.schemas import Segment, Transcript
 
 REPETITION = re.compile(
@@ -16,6 +17,7 @@ REPETITION_WARNING = (
     "음성 인식에서 비정상적인 반복을 감지했습니다. "
     "재인식 후에도 불확실한 반복 부분은 제외했으니 원음으로 확인해 주세요."
 )
+MARKUP_NOISE = re.compile(r"[\s\\/\-_*#`|]+")
 
 
 class WhisperTranscriber:
@@ -84,6 +86,7 @@ class WhisperTranscriber:
         word_cutoff: float | None = None,
         context_samples: int = 0,
         realtime: bool = False,
+        beam_size: int | None = None,
         end_cutoff: float | None = None,
     ) -> Transcript:
         import numpy as np
@@ -91,6 +94,12 @@ class WhisperTranscriber:
         waveform = np.frombuffer(audio.pcm, dtype="<i2").astype(np.float32) / 32768
         if waveform.size == 0 or float(np.max(np.abs(waveform))) < 1e-5:
             return Transcript(text="", provider=self.name, duration_seconds=audio.duration_seconds)
+        if beam_size is None:
+            beam_size = (
+                self.settings.whisper_realtime_beam_size
+                if realtime
+                else self.settings.whisper_beam_size
+            )
         with self._lock:
             model = self._load()
             warnings, retry_budget = [], [1]
@@ -104,6 +113,7 @@ class WhisperTranscriber:
                     else audio.duration_seconds,
                     word_cutoff,
                     realtime,
+                    beam_size=beam_size,
                     warnings=warnings,
                     retry_budget=retry_budget,
                 )
@@ -124,6 +134,7 @@ class WhisperTranscriber:
                             audio.duration_seconds - context_seconds,
                             None,
                             realtime,
+                            beam_size=beam_size,
                             warnings=warnings,
                             retry_budget=retry_budget,
                         )
@@ -140,7 +151,7 @@ class WhisperTranscriber:
                         )
             except Exception as exc:
                 raise ServiceError(503, "STT_FAILED", "음성 인식 처리에 실패했습니다.") from exc
-        text = " ".join(s.text for s in result)
+        text = " ".join(s.text for s in result if s.recognition_status != "needs_review")
         if len(text) > 20000:
             raise ServiceError(413, "TRANSCRIPT_TOO_LONG", "전사 텍스트가 20,000자를 초과했습니다.")
         return Transcript(
@@ -161,6 +172,7 @@ class WhisperTranscriber:
         cutoff,
         realtime=False,
         *,
+        beam_size,
         repair=False,
         warnings=None,
         retry_budget=None,
@@ -169,11 +181,7 @@ class WhisperTranscriber:
             waveform,
             language=None if language == "auto" else language,
             vad_filter=True,
-            beam_size=(
-                self.settings.whisper_realtime_beam_size
-                if realtime
-                else self.settings.whisper_beam_size
-            ),
+            beam_size=beam_size,
             best_of=1 if realtime else 5,
             temperature=(0.0, 0.2)
             if repair
@@ -181,7 +189,11 @@ class WhisperTranscriber:
             # Bound runaway decoding without banning ordinary repeated replies.
             no_repeat_ngram_size=6 if repair else 12,
             repetition_penalty=1.1 if repair else 1.0,
-            max_new_tokens=min(400, max(96, math.ceil(duration * 24) + 32)),
+            max_new_tokens=(
+                min(220, max(80, math.ceil(duration * 14) + 28))
+                if realtime
+                else min(400, max(96, math.ceil(duration * 24) + 32))
+            ),
             # Do not seed symptom words: Whisper can copy them into noisy/short
             # windows even when they were never spoken.
             hotwords=None,
@@ -206,27 +218,53 @@ class WhisperTranscriber:
             clean = self._segment(segment, duration, cutoff)
             if clean is not None:
                 result.append(clean)
-        if any(REPETITION.search(segment.text) for segment in result):
+        loops = runaway_segment_indices(result)
+        exact_repetition = any(REPETITION.search(segment.text) for segment in result)
+        if loops or exact_repetition:
             if retry_budget and retry_budget[0]:
                 retry_budget[0] -= 1
-                return self._decode(
+                retry_warnings = []
+                retried, retry_info = self._decode(
                     model,
                     waveform,
                     language,
                     duration,
                     cutoff,
                     realtime,
+                    beam_size=beam_size,
                     repair=True,
-                    warnings=warnings,
+                    warnings=retry_warnings,
                     retry_budget=retry_budget,
                 )
+                if not loops or (
+                    retried
+                    and all(s.recognition_status != "needs_review" for s in retried)
+                    and all(
+                        any(
+                            s.start < result[index].end and s.end > result[index].start
+                            for s in retried
+                        )
+                        for index in loops
+                    )
+                ):
+                    if warnings is not None:
+                        warnings.extend(w for w in retry_warnings if w not in warnings)
+                    return retried, retry_info
             cleaned = []
-            for segment in result:
+            for index, segment in enumerate(result):
+                if index in loops:
+                    cleaned.append(
+                        segment.model_copy(update={"recognition_status": "needs_review"})
+                    )
+                    continue
                 text = REPETITION.sub("", segment.text).strip()
                 if text:
                     cleaned.append(segment.model_copy(update={"text": text}))
-            if warnings is not None and REPETITION_WARNING not in warnings:
-                warnings.append(REPETITION_WARNING)
+            if warnings is not None:
+                if loops and REVIEW_WARNING not in warnings:
+                    warnings.append(REVIEW_WARNING)
+                if exact_repetition and REPETITION_WARNING not in warnings:
+                    warnings.append(REPETITION_WARNING)
             result = cleaned
         return result, info
 
@@ -249,7 +287,7 @@ class WhisperTranscriber:
                     text = "".join(word.word for word in kept)
             elif start < cutoff:
                 return None
-        if not text.strip() or start >= duration:
+        if not text.strip() or MARKUP_NOISE.fullmatch(text) or start >= duration:
             return None
         # Decoder timestamps can extend past a short PCM window.
         return Segment(start=start, end=min(end, duration), text=text)

@@ -2,6 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from google.genai.errors import ClientError, ServerError
 from langchain_core.messages import AIMessage
@@ -260,6 +261,12 @@ def test_wrapped_provider_error_is_classified_without_exposing_message():
     wrapper = RuntimeError("unsafe message")
     wrapper.__cause__ = root
     assert error_details(wrapper) == (503, "UPSTREAM_UNAVAILABLE")
+
+
+def test_connection_refusal_has_specific_error_reason():
+    error = httpx.ConnectError("private connection detail")
+    error.__cause__ = OSError("socket refused")
+    assert error_details(error) == (None, "CONNECTION_FAILED")
 
 
 def test_application_timeout_stays_bounded_independent_of_provider_deadline():

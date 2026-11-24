@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     whisper_local_files_only: bool = False
     whisper_cpu_threads: int = Field(default=4, ge=1, le=32)
     whisper_beam_size: int = Field(default=1, ge=1, le=10)
-    whisper_realtime_beam_size: int = Field(default=2, ge=1, le=5)
+    whisper_realtime_beam_size: int = Field(default=1, ge=1, le=5)
     torch_cpu_threads: int = Field(default=2, ge=1, le=16)
     transcriber_factory: str = ""
     diarizer_factory: str = ""

@@ -4,6 +4,7 @@ from threading import Lock
 from app.audio import SAMPLE_RATE, AudioInput
 from app.config import ROOT, Settings
 from app.errors import ServiceError
+from app.models import torch_model_load_lock
 from app.schemas import SpeakerSpan
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,8 @@ class Wav2Vec2Diarizer:
         with self._load_lock:
             if self._runtime is None and not self._load_failed:
                 try:
-                    self._runtime = self._load_checkpoint()
+                    with torch_model_load_lock:
+                        self._runtime = self._load_checkpoint()
                 except Exception as exc:
                     self._load_failed = True
                     raise ServiceError(

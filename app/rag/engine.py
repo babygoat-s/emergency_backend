@@ -3,8 +3,15 @@ import logging
 from threading import Lock
 from time import monotonic
 
-from app.rag.enrichment import numbers_supported, question_text
-from app.rag.question_bank import active_binding, local_question
+from app.rag.enrichment import numbers_supported, question_text, reported_text
+from app.rag.question_bank import (
+    active_binding,
+    contextual_question,
+    local_question,
+    matches_question_focus,
+    relevant_question,
+    reported_protocol,
+)
 from app.rag.rules import SYMPTOM_PROTOCOLS, field_for
 from app.rag.schemas import (
     Observation,
@@ -15,6 +22,7 @@ from app.rag.schemas import (
 )
 from app.rag.state import update_state
 from app.rag.store import ManualStore
+from app.rag.urgency import classify_manual_urgency
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +51,14 @@ def conditions_met(binding, state):
 
 
 def answered(question, state):
-    fact = state.fields.get(field_for(question), Observation())
+    return field_answered(field_for(question), question.text, state)
+
+
+def field_answered(field, source_text, state):
+    fact = state.fields.get(field, Observation())
     if fact.status != "confirmed":
         return False
-    if field_for(question) == "breathing":
-        if "정상" in question.text and fact.value == "present":
-            return False
-    return True
+    return not (field == "breathing" and "정상" in source_text and fact.value == "present")
 
 
 class RagEngine:
@@ -86,7 +95,15 @@ class RagEngine:
                     "매뉴얼 인덱스를 사용할 수 없습니다. PDF 인덱싱을 완료하고 서버를 재시작하세요."
                 ),
             )
+        rule_state = update_state(turns, store.questions) if state is not None or previous else None
         state = state or update_state(turns, store.questions, previous)
+        manual_urgency = classify_manual_urgency(rule_state or state, store.chunks)
+        if manual_urgency:
+            reference = manual_urgency.reference
+            urgency = UrgencyProposal(
+                reason=f"매뉴얼 분류 {reference.category} · {reference.text} "
+                f"(PDF {reference.source.pdf_page}쪽)"
+            )
         protocols = set(state.protocol_ids)
         for symptom in symptoms:
             protocol = SYMPTOM_PROTOCOLS.get(symptom.code)
@@ -98,9 +115,10 @@ class RagEngine:
                         status="uncertain", value="yes", origin="symptom_model"
                     )
                 protocols.add(protocol)
+        current = rule_state or state
         urgent = any(
-            state.fields.get(field, Observation()).status == "uncertain"
-            or state.fields.get(field, Observation()).value == "absent"
+            current.fields.get(field, Observation()).status == "uncertain"
+            or current.fields.get(field, Observation()).value == "absent"
             for field in ("consciousness", "breathing")
         )
         if urgent:
@@ -112,7 +130,9 @@ class RagEngine:
             "protocol_filter": ["INTRO", *state.protocol_ids],
             "index_release": store.manifest["release"],
         }
-        if semantic and not urgent:
+        if self.settings.rag_llm_compact_request and not getattr(store, "semantic_ready", True):
+            semantic = False
+        if semantic and not urgent and reported_text(turns):
             query = " ".join([c.label for c in symptoms] + [t.text for t in turns[-3:]])
             try:
                 if not protocols:
@@ -148,6 +168,8 @@ class RagEngine:
             )
             if (
                 binding["review_reasons"]
+                or (urgent and binding["field"] not in {"location", "callback"})
+                or not relevant_question(chunk, binding, state)
                 or not conditions_met(binding, state)
                 or answered(chunk, state)
             ):
@@ -167,19 +189,28 @@ class RagEngine:
             )
             for protocol in protocols
         }
-        candidates.sort(
-            key=lambda item: (
-                item[1]["priority"],
-                0
-                if item[0].source.protocol_id == "P02" and "P02" in protocols
-                else 1
-                if item[0].source.protocol_id == "INTRO"
-                else 2,
-                protocol_scores.get(item[0].source.protocol_id, 2.0),
-                item[0].source.protocol_id,
-                item[0].order,
+
+        def rank(item):
+            chunk, binding = item
+            protocol = chunk.source.protocol_id
+            if binding["priority"] == 1:
+                group = 0
+            elif reported_protocol(state, protocol) and binding["priority"] < 4:
+                group = 1
+            elif protocol == "INTRO":
+                group = 2
+            else:
+                group = 3
+            return (
+                group,
+                binding["priority"],
+                0 if protocol == "P02" else 1 if protocol != "INTRO" else 2,
+                protocol_scores.get(protocol, 2.0),
+                protocol,
+                chunk.order,
             )
-        )
+
+        candidates.sort(key=rank)
         selected = []
         used_fields = set()
         for chunk, binding in candidates:
@@ -196,7 +227,7 @@ class RagEngine:
             )
             selected.append(
                 Recommendation(
-                    question=local_question(chunk),
+                    question=contextual_question(local_question(chunk), binding["field"], state),
                     reason=reason,
                     related_symptom=chunk.protocol_name,
                     priority=binding["priority"],
@@ -256,6 +287,7 @@ class RagEngine:
             instruction_references=instructions,
             requires_immediate_operator_review=urgent,
             urgency=urgency,
+            manual_urgency=manual_urgency,
             message=message,
             retrieval=retrieval,
             review_count=store.manifest["review_items"],
@@ -264,7 +296,8 @@ class RagEngine:
         if self.settings.rag_llm_provider == "disabled":
             result.llm_status = "disabled"
             result.summary_provider = "disabled"
-            result.urgency.reason = "요약·긴급도 AI를 보류했습니다. 상담원이 직접 판단해 주세요."
+            if not manual_urgency:
+                result.urgency = UrgencyProposal.operator_review()
         return result
 
     def question_context(self, result):
@@ -284,7 +317,11 @@ class RagEngine:
             )
             if binding["field"] not in fields or binding["review_reasons"]:
                 continue
-            if not conditions_met(binding, result.state) or answered(chunk, result.state):
+            if (
+                not relevant_question(chunk, binding, result.state)
+                or not conditions_met(binding, result.state)
+                or answered(chunk, result.state)
+            ):
                 continue
             # Primary candidates plus a bounded number of same-field source details.
             field_count = sum(c["field"] == binding["field"] for c in context.values())
@@ -294,7 +331,7 @@ class RagEngine:
             sources[chunk.source.question_id] = chunk.source
         return context, sources
 
-    async def refine(self, turns, result, symptoms=()):
+    async def refine(self, turns, result, symptoms=(), *, mode="combined"):
         if self.settings.rag_llm_provider == "disabled":
             from starlette.concurrency import run_in_threadpool
 
@@ -318,19 +355,37 @@ class RagEngine:
             self._llm = RagLLM(self.settings)
 
         context, sources = {}, {}
-        if result.status != "index_unavailable":
+        if result.status != "index_unavailable" and mode != "summary":
             if (
-                not result.requires_immediate_operator_review
+                mode == "combined"
+                and not result.requires_immediate_operator_review
                 and result.retrieval.get("mode") != "chroma_semantic_and_metadata"
             ):
                 result = await run_in_threadpool(
                     self.recommend, turns, symptoms, state=result.state.model_copy(deep=True)
                 )
-            context, sources = self.question_context(result)
-        enriched = await self._llm.enrich(turns, result, context)
+            if mode == "questions" and (
+                result.requires_immediate_operator_review or not result.questions
+            ):
+                return result.model_copy(update={"questions": [], "questions_status": "not_needed"})
+            context, sources = await run_in_threadpool(self.question_context, result)
+        if mode == "questions" and not result.questions:
+            return result.model_copy(update={"questions_status": "not_needed"})
+        options = (
+            {"questions_only": True}
+            if mode == "questions"
+            else {"summary_only": True}
+            if mode == "summary"
+            else {}
+        )
+        enriched = await self._llm.enrich(turns, result, context, **options)
+        compact = (
+            self.settings.rag_llm_provider == "openai_compatible"
+            and self.settings.rag_llm_compact_request
+        )
         refined = (
             result.model_copy(deep=True)
-            if result.status == "index_unavailable"
+            if compact or result.status == "index_unavailable"
             else self.recommend(turns, symptoms, semantic=False, state=enriched.state)
         )
         refined.retrieval = result.retrieval
@@ -348,7 +403,16 @@ class RagEngine:
         if enriched.summary:
             refined.summary = enriched.summary
             refined.summary_provider = "llm"
-        refined.urgency = enriched.urgency
+        if mode == "summary":
+            refined.questions = []
+            return refined
+        if mode == "questions":
+            refined.questions_status = (
+                "completed" if enriched.status == "completed" else "unavailable"
+            )
+            refined.summary_provider = "pending"
+        if not refined.manual_urgency and not self.settings.rag_llm_compact_request:
+            refined.urgency = enriched.urgency
         if result.requires_immediate_operator_review:
             refined.requires_immediate_operator_review = True
             refined.safety_alerts = result.safety_alerts
@@ -379,9 +443,13 @@ class RagEngine:
                 if not numbers_supported(draft.question, evidence):
                     continue
                 text = question_text(draft.question)
-                if not text:
+                if (
+                    not text
+                    or text == question.source_excerpt
+                    or not matches_question_focus(question.field, text)
+                ):
                     continue
-                question.question = text
+                question.question = contextual_question(text, question.field, refined.state)
                 # Keep the source/state-based local rationale. The model may
                 # paraphrase a question, but cannot add medical causal claims.
                 question.supporting_sources = [sources[i] for i in ids if i != key]

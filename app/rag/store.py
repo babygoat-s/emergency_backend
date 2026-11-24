@@ -55,6 +55,10 @@ class ManualStore:
         self._collection = None
         self._lock = Lock()
 
+    @property
+    def semantic_ready(self):
+        return self._collection is not None
+
     def _load(self):
         with self._lock:
             if self._collection is None:

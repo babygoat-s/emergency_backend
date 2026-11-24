@@ -178,6 +178,24 @@ def test_uncertain_replies_are_excluded_from_classifier_and_manual_context(backe
     assert trusted_text(result.transcript) == "환자가 구토해요"
 
 
+def test_live_numeric_loop_is_flagged_without_removing_real_numbers(backend):
+    statement = "체온은 39도예요. 주소는 12번지이고 연락처는 010-1234-5678입니다."
+    loop = "1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, 10, 11, 12, 13"
+    result = AnalysisResponse(
+        analysis_provider="test",
+        transcript=Transcript(
+            text=f"{statement} {loop}",
+            provider="test",
+            segments=[Segment(start=0, end=4, text=statement), Segment(start=4, end=5, text=loop)],
+        ),
+    )
+    RealtimeSession.flag_uncertain_replies(result)
+    assert result.transcript.segments[0].recognition_status == "recognized"
+    assert result.transcript.segments[1].recognition_status == "needs_review"
+    assert trusted_text(result.transcript) == statement
+    assert [turn.text for turn in backend.service.conversation(result)] == [statement]
+
+
 def session(backend):
     backend.service.realtime_transcriber = WhisperTranscriber(backend.service.settings)
     start = StreamStart(type="start", encoding="pcm_s16le", sample_rate=16000, channels=1)
@@ -202,8 +220,46 @@ def test_catchup_preserves_every_pcm_byte_and_eof(backend):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("success", [True, False])
-def test_review_revises_without_dropping_untouched_context(backend, success):
+def test_realtime_uses_fast_beam_for_backlog_then_restores_configured_beam(backend):
+    async def run():
+        settings = backend.service.settings
+        settings.rag_enabled = True
+        settings.rag_llm_provider = "openai_compatible"
+        settings.rag_llm_compact_request = True
+        settings.realtime_window_seconds = 6
+        settings.realtime_batch_seconds = 18
+        settings.whisper_realtime_beam_size = 3
+        stream = session(backend)
+        beams = []
+
+        def decode(waveform, **options):
+            beams.append(options["beam_size"])
+            duration = len(waveform) / 16000
+            segment = SimpleNamespace(start=duration - 1, end=duration, text="새 발화", words=[])
+            return iter([segment]), SimpleNamespace(language="ko", duration_after_vad=duration)
+
+        stream.service.realtime_transcriber._model = SimpleNamespace(transcribe=decode)
+        frame = b"\x01\x00" * (6 * 16000)
+        stream.total_bytes = 3 * len(frame)
+        for i in range(3):
+            stream.enqueue_audio(frame, i * 6)
+
+        async def send(event):
+            if event["sequence"] == 1:
+                stream.total_bytes += len(frame)
+                stream.enqueue_audio(frame, 18)
+                stream.audio_queue.put_nowait(None)
+
+        stream.ws.send_json.side_effect = send
+        await asyncio.wait_for(stream.process_audio(), timeout=5)
+        assert beams == [1, 3]
+        assert stream.cumulative.transcript.duration_seconds == 24
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("review", ["corrected", "empty", "repeated"])
+def test_review_revises_without_dropping_untouched_context(backend, review):
     async def run():
         stream = session(backend)
         stream.settings.rag_enabled = False
@@ -219,10 +275,14 @@ def test_review_revises_without_dropping_untouched_context(backend, success):
                 text="기존 발화 뒤 발화", segments=old, provider="test", revision=1
             ),
         )
-        replacement = [Segment(start=2, end=6, text="팔이 마비됐어요")] if success else []
+        replacement = []
+        if review == "corrected":
+            replacement = [Segment(start=2, end=6, text="팔이 마비됐어요")]
+        elif review == "repeated":
+            replacement = [Segment(start=2, end=6, text="이 시그에는 이 시그엔 " * 4)]
         backend.service.recheck_audio = AsyncMock(
             return_value=Transcript(
-                text="팔이 마비됐어요" if success else "", provider="test", segments=replacement
+                text=" ".join(s.text for s in replacement), provider="test", segments=replacement
             )
         )
         await stream.recheck_suspicious_audio()
@@ -230,12 +290,13 @@ def test_review_revises_without_dropping_untouched_context(backend, success):
         assert updated.transcript.revision == 2
         assert updated.transcript.segments[0].text == "기존 발화"
         assert updated.transcript.segments[-1].text == "뒤 발화"
-        if success:
+        if review == "corrected":
             assert "팔이 마비됐어요" in updated.transcript.text
             assert any(s.recognition_status == "rechecked" for s in updated.transcript.segments)
         else:
             assert REVIEW_FAILED in updated.warnings
             assert any(s.recognition_status == "needs_review" for s in updated.transcript.segments)
+            assert updated.transcript.text == "기존 발화 뒤 발화"
         queued = stream.symptom_queue.get_nowait()
         assert queued[2].analysis is None
         assert queued[2].symptoms == []

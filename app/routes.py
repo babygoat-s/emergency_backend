@@ -101,16 +101,25 @@ async def example():
 
 @router.post("/rag/recommend", response_model=RagResult, summary="대화 기반 매뉴얼 후속 질문 추천")
 async def recommend_questions(payload: RecommendRequest, service: Service):
+    symptoms, estimates = [], []
+    if payload.use_llm:
+        symptoms, estimates = await service.text_question_symptoms(payload.conversation)
     try:
         result = await run_in_threadpool(
-            service.rag.recommend, payload.conversation, previous=payload.previous_state
+            service.rag.recommend,
+            payload.conversation,
+            symptoms,
+            previous=payload.previous_state,
+            estimates=estimates,
         )
     except ValueError as exc:
         raise ServiceError(
             422, "INVALID_CONVERSATION", "대화 ID 중복 또는 길이를 확인하세요."
         ) from exc
     if payload.use_llm:
-        result = await service.rag.refine(payload.conversation, result)
+        result = await service.rag.refine(
+            payload.conversation, result, symptoms, estimates=estimates
+        )
     return result.for_client()
 
 

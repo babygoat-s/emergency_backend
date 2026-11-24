@@ -87,7 +87,7 @@ class KoElectraClassifier:
     def warmup(self):
         self._load()
 
-    def predict(self, text: str, *, window_cache=None) -> list[Symptom]:
+    def predict(self, text: str, *, window_cache=None, utterances=()) -> list[Symptom]:
         if not text.strip():
             if window_cache is not None:
                 window_cache.clear()
@@ -97,8 +97,9 @@ class KoElectraClassifier:
         import torch
 
         try:
+            texts = list(dict.fromkeys((text, *utterances))) if utterances else text
             windows = tokenizer(
-                text,
+                texts,
                 truncation=True,
                 max_length=max_length,
                 stride=stride,

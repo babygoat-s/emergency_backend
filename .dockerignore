@@ -1,7 +1,8 @@
 **
 !pyproject.toml
 !app/**
-!models/정리모델_3개.pt
+!models/라벨v2모델.pt
+!models/원본모델.pt
 !models/Speaker Diarization.pth
 !models/tokenizer/*.json
 !models/tokenizer/vocab.txt

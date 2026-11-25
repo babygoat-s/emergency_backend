@@ -31,7 +31,8 @@ ENV WHISPER_MODEL=models/whisper-small \
     WHISPER_CPU_THREADS=4 \
     WHISPER_REPAIR_MODEL=models/whisper-turbo \
     TORCH_CPU_THREADS=1 \
-    SYMPTOM_MODEL_PATH=models/정리모델_3개.pt \
+    SYMPTOM_MODEL_PATH=models/라벨v2모델.pt \
+    SYMPTOM_ESTIMATOR_MODEL_PATH=models/원본모델.pt \
     SYMPTOM_TOKENIZER_PATH=models/tokenizer \
     SPEAKER_MODEL_PATH="models/Speaker Diarization.pth" \
     SPEAKER_CLASS_ROLES='["operator","caller"]' \
@@ -44,7 +45,7 @@ ENV WHISPER_MODEL=models/whisper-small \
     MAX_CONCURRENT_INFERENCES=1
 
 USER appuser
-RUN python -c "from pathlib import Path; from app.config import Settings; from app.rag.store import ManualStore; s=Settings(); files=(s.symptom_model_path,s.speaker_model_path,s.symptom_tokenizer_path+'/vocab.txt',s.rag_embedding_model+'/model.safetensors',s.whisper_model+'/model.bin',s.whisper_repair_model+'/model.bin'); missing=[p for p in files if not Path(p).is_file()]; assert not missing, missing; assert (ManualStore(s).path/'chroma'/'chroma.sqlite3').is_file()"
+RUN python -c "from pathlib import Path; from app.config import Settings; from app.rag.store import ManualStore; s=Settings(); files=(s.symptom_model_path,s.symptom_estimator_model_path,s.speaker_model_path,s.symptom_tokenizer_path+'/vocab.txt',s.rag_embedding_model+'/model.safetensors',s.whisper_model+'/model.bin',s.whisper_repair_model+'/model.bin'); missing=[p for p in files if not Path(p).is_file()]; assert not missing, missing; assert (ManualStore(s).path/'chroma'/'chroma.sqlite3').is_file()"
 
 EXPOSE 8080
 CMD ["sh", "-c", "exec python -m uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-8080}\""]

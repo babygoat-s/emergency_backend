@@ -48,9 +48,18 @@ def load_provider(spec: str, settings: Settings):
 
 
 def assign_speaker(segment: Segment, spans: list[SpeakerSpan], available: bool):
-    matches = [s for s in spans if s.start < segment.end and s.end > segment.start]
-    if matches and len({s.speaker_id for s in matches}) == 1:
-        segment.speaker_id, segment.speaker = matches[0].speaker_id, matches[0].role
+    # Speaker chunks are not aligned with transcript segments, so a segment usually
+    # touches several chunks. Use the confident speaker with the longest overlap.
+    overlap: dict[str, float] = {}
+    roles = {}
+    for span in spans:
+        shared = min(span.end, segment.end) - max(span.start, segment.start)
+        if shared > 0 and span.speaker_id != "unknown":
+            overlap[span.speaker_id] = overlap.get(span.speaker_id, 0.0) + shared
+            roles[span.speaker_id] = span.role
+    if overlap:
+        best = max(overlap, key=overlap.__getitem__)
+        segment.speaker_id, segment.speaker = best, roles[best]
     elif available:
         segment.speaker_id, segment.speaker = None, "unknown"
 

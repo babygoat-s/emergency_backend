@@ -2,6 +2,41 @@ import pytest
 
 from app.audio import SAMPLE_RATE, AudioInput
 from app.models.wav2vec2_speakers import Wav2Vec2Diarizer
+from app.schemas import Segment, SpeakerSpan
+from app.services import assign_speaker
+
+
+def span(start, end, speaker_id, role):
+    return SpeakerSpan(start=start, end=end, speaker_id=speaker_id, role=role)
+
+
+OPERATOR, CALLER = ("speaker_0", "operator"), ("speaker_1", "caller")
+
+
+@pytest.mark.parametrize(
+    ("spans", "expected"),
+    [
+        ([span(0, 4, *OPERATOR)], OPERATOR),
+        # A segment crossing a chunk boundary takes the speaker covering most of it.
+        ([span(0, 3, *OPERATOR), span(3, 4, *CALLER)], OPERATOR),
+        ([span(0, 1, *OPERATOR), span(1, 4, *CALLER)], CALLER),
+        # Low-confidence chunks do not hide a confident one.
+        ([span(0, 2, *OPERATOR), span(2, 4, "unknown", "unknown")], OPERATOR),
+        ([span(0, 4, "unknown", "unknown")], (None, "unknown")),
+        ([span(5, 8, *CALLER)], (None, "unknown")),
+        ([], (None, "unknown")),
+    ],
+)
+def test_segment_takes_confident_speaker_with_longest_overlap(spans, expected):
+    segment = Segment(start=0, end=4, text="네 119입니다.")
+    assign_speaker(segment, spans, available=True)
+    assert (segment.speaker_id, segment.speaker) == expected
+
+
+def test_segment_keeps_speaker_when_diarization_is_unavailable():
+    segment = Segment(start=0, end=4, text="네", speaker="caller", speaker_id="speaker_1")
+    assign_speaker(segment, [], available=False)
+    assert (segment.speaker_id, segment.speaker) == ("speaker_1", "caller")
 
 
 def test_speaker_chunks_cover_long_speech_and_use_configured_roles(settings, monkeypatch):

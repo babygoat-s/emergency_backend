@@ -83,11 +83,6 @@ class Symptom(StrictModel):
     score: float | None = Field(default=None, ge=0, le=1)
 
 
-class Urgency(StrictModel):
-    level: Literal["minimal", "low", "moderate", "high", "critical", "unknown"]
-    reason: str = Field(min_length=1, max_length=1500)
-
-
 class Question(StrictModel):
     question: str = Field(min_length=1, max_length=1000)
     purpose: str = Field(min_length=1, max_length=500)
@@ -96,7 +91,6 @@ class Question(StrictModel):
 class Situation(StrictModel):
     summary: str = Field(min_length=1, max_length=1500)
     symptoms: list[Symptom] = Field(max_length=10)
-    urgency: Urgency
     recommended_questions: list[Question] = Field(max_length=5)
 
     @field_validator("symptoms")
@@ -157,6 +151,7 @@ class StreamStart(StrictModel):
     sample_rate: Literal[16000] = 16000
     channels: Literal[1] = 1
     language: Literal["ko", "en", "ja", "auto"] = "ko"
+    operator_voice_sample: bool = False
 
 
 class HealthResponse(StrictModel):
@@ -181,6 +176,7 @@ class ConfigResponse(StrictModel):
     languages: list[str]
     transcriber: str
     diarizer: str
+    operator_voice_sample_supported: bool = False
     symptom_classifier: str
     koelectra_symptom_labels: list[str]
     example_preview: ExamplePreview

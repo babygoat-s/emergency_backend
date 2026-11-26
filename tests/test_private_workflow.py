@@ -140,9 +140,7 @@ def test_local_llm_receives_original_turn_and_returns_grounded_analysis(monkeypa
     assert enriched.status == "completed"
     assert enriched.model == "qwen3.5:4b"
     assert enriched.summary == summary
-    assert enriched.urgency.level == "unknown"
-    assert enriched.urgency.origin == "unavailable"
-    assert not enriched.urgency.evidence
+    assert "urgency" not in enriched.model_dump()
 
 
 def segments():

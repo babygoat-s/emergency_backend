@@ -20,11 +20,9 @@ from app.rag.schemas import (
     RagResult,
     Recommendation,
     Reference,
-    UrgencyProposal,
 )
 from app.rag.state import update_state
 from app.rag.store import ManualStore
-from app.rag.urgency import classify_manual_urgency
 
 logger = logging.getLogger(__name__)
 
@@ -109,32 +107,18 @@ class RagEngine:
     def recommend(
         self, turns, symptoms=(), previous=None, *, semantic=True, state=None, estimates=()
     ):
-        urgency = UrgencyProposal()
-        if (
-            self.settings.rag_llm_provider == "openai_compatible"
-            and self.settings.rag_llm_compact_request
-        ):
-            urgency = UrgencyProposal.operator_review()
         try:
             store = self.store()
         except (OSError, ValueError, ImportError, KeyError):
             return RagResult(
                 status="index_unavailable",
                 state=update_state(turns, [], previous),
-                urgency=urgency,
                 message=(
                     "매뉴얼 인덱스를 사용할 수 없습니다. PDF 인덱싱을 완료하고 서버를 재시작하세요."
                 ),
             )
         rule_state = update_state(turns, store.questions) if state is not None or previous else None
         state = state or update_state(turns, store.questions, previous)
-        manual_urgency = classify_manual_urgency(rule_state or state, store.chunks)
-        if manual_urgency:
-            reference = manual_urgency.reference
-            urgency = UrgencyProposal(
-                reason=f"매뉴얼 분류 {reference.category} · {reference.text} "
-                f"(PDF {reference.source.pdf_page}쪽)"
-            )
         protocols = set(state.protocol_ids)
         confirmed_codes = {symptom.code for symptom in symptoms}
         duplicates = confirmed_codes.intersection(symptom.code for symptom in estimates)
@@ -279,11 +263,6 @@ class RagEngine:
             if len(selected) >= 18:
                 break
         selected[2:2] = screening
-        classifications = [
-            Reference(text=c.text, source=c.source, category=c.source_category)
-            for c in store.chunks
-            if c.kind == "classification" and c.source.protocol_id in protocols
-        ]
         instructions = [
             Reference(text=c.text, source=c.source)
             for c in store.chunks
@@ -323,11 +302,8 @@ class RagEngine:
             state=state,
             questions=selected[: 1 if urgent else 3],
             safety_alerts=alerts,
-            classification_references=classifications,
             instruction_references=instructions,
             requires_immediate_operator_review=urgent,
-            urgency=urgency,
-            manual_urgency=manual_urgency,
             message=message,
             retrieval=retrieval,
             review_count=store.manifest["review_items"],
@@ -336,8 +312,6 @@ class RagEngine:
         if self.settings.rag_llm_provider == "disabled":
             result.llm_status = "disabled"
             result.summary_provider = "disabled"
-            if not manual_urgency:
-                result.urgency = UrgencyProposal.operator_review()
         return result
 
     def question_context(self, result):
@@ -466,8 +440,6 @@ class RagEngine:
                 "completed" if enriched.status == "completed" else "unavailable"
             )
             refined.summary_provider = "pending"
-        if not refined.manual_urgency and not self.settings.rag_llm_compact_request:
-            refined.urgency = enriched.urgency
         if result.requires_immediate_operator_review:
             refined.requires_immediate_operator_review = True
             refined.safety_alerts = result.safety_alerts
@@ -527,7 +499,7 @@ class RagEngine:
                     rewrite(turns, refined, missing, repair_context), timeout=remaining
                 )
             except TimeoutError:
-                pass  # Keep successful summary/urgency and the grounded source question.
+                pass  # Keep the summary and the grounded source question.
             else:
                 apply_drafts(repaired.questions, missing, repair_context, repair_sources)
         return refined

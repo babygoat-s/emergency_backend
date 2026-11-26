@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
 from threading import Lock
+from typing import TYPE_CHECKING
 
 from app.audio import SAMPLE_RATE, AudioInput
 from app.config import ROOT, Settings
@@ -7,11 +11,23 @@ from app.errors import ServiceError
 from app.models import torch_model_load_lock
 from app.schemas import SpeakerSpan
 
+if TYPE_CHECKING:
+    from torch import Tensor
+
 logger = logging.getLogger(__name__)
 
 MAX_SAMPLES = 4 * SAMPLE_RATE
 BATCH_SIZE = 4
 MIN_CONFIDENCE = 0.75
+MIN_OPERATOR_SPEECH_SECONDS = 4
+MAX_OPERATOR_SAMPLE_SECONDS = 20
+MIN_MATCH_SAMPLES = 3 * SAMPLE_RATE // 2
+
+
+@dataclass(frozen=True)
+class OperatorVoiceReference:
+    vector: Tensor
+    match_threshold: float
 
 
 class Wav2Vec2Diarizer:
@@ -87,7 +103,7 @@ class Wav2Vec2Diarizer:
             self.warmup()
             if self._runtime is None:
                 return None
-            return self._predict_spans(audio)
+            return self._predict_spans(audio, state.get("operator_voice_reference"))
         except ServiceError as exc:
             logger.warning("Speaker model unavailable (%s)", exc.code)
             return None
@@ -95,7 +111,8 @@ class Wav2Vec2Diarizer:
             logger.warning("Speaker inference failed")
             return None
 
-    def _predict_spans(self, audio: AudioInput) -> list[SpeakerSpan]:
+    @staticmethod
+    def _speech_regions(audio: AudioInput):
         import numpy as np
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
@@ -104,6 +121,50 @@ class Wav2Vec2Diarizer:
             waveform,
             VadOptions(min_speech_duration_ms=200, min_silence_duration_ms=250, speech_pad_ms=80),
         )
+        return waveform, regions
+
+    def enroll_operator(self, audio: AudioInput) -> OperatorVoiceReference:
+        import numpy as np
+        import torch
+        from torch.nn.functional import normalize
+
+        self.warmup()
+        if self._runtime is None:
+            raise ServiceError(503, "SPEAKER_MODEL_UNAVAILABLE", "화자 모델 설정을 확인하세요.")
+        waveform, regions = self._speech_regions(audio)
+        if sum(r["end"] - r["start"] for r in regions) < MIN_OPERATOR_SPEECH_SECONDS * SAMPLE_RATE:
+            raise ServiceError(
+                422, "OPERATOR_VOICE_TOO_SHORT", "상담원 음성이 4초 이상 필요합니다."
+            )
+
+        spoken = np.concatenate([waveform[r["start"] : r["end"]] for r in regions])
+        count = max(2, (len(spoken) + MAX_SAMPLES - 1) // MAX_SAMPLES)
+        clips = np.array_split(spoken, count)
+        with torch.inference_mode():
+            vectors = torch.cat(
+                [
+                    self._pool(clips[i : i + BATCH_SIZE], embed=True)[1]
+                    for i in range(0, count, BATCH_SIZE)
+                ]
+            )
+            total = vectors.sum(dim=0)
+            # Each clip is compared with a reference made from the other clips.
+            agreement = (vectors * normalize(total - vectors)).sum(dim=-1).min().item()
+            if not 0.70 <= agreement <= 1.001:
+                raise ServiceError(
+                    422, "OPERATOR_VOICE_INCONSISTENT", "한 사람의 목소리로 다시 녹음해 주세요."
+                )
+            return OperatorVoiceReference(
+                vector=normalize(total, dim=0),
+                match_threshold=max(0.80, min(0.88, agreement - 0.06)),
+            )
+
+    def _predict_spans(
+        self, audio: AudioInput, reference: OperatorVoiceReference | None
+    ) -> list[SpeakerSpan]:
+        import numpy as np
+
+        waveform, regions = self._speech_regions(audio)
         intervals = []
         for region in regions:
             start, end = region["start"], region["end"]
@@ -115,21 +176,55 @@ class Wav2Vec2Diarizer:
         spans = []
         for offset in range(0, len(intervals), BATCH_SIZE):
             batch = intervals[offset : offset + BATCH_SIZE]
-            predictions = self._classify([waveform[start:end] for start, end in batch])
-            for (start, end), (label, confidence) in zip(batch, predictions, strict=True):
-                reliable = confidence >= MIN_CONFIDENCE
+            predictions = self._classify([waveform[start:end] for start, end in batch], reference)
+            for (start, end), (label, confidence, similarity) in zip(
+                batch, predictions, strict=True
+            ):
+                speaker_id, role = self._role(label, confidence, similarity, end - start, reference)
                 spans.append(
                     SpeakerSpan(
                         start=float(start) / SAMPLE_RATE,
                         end=float(end) / SAMPLE_RATE,
-                        speaker_id=f"speaker_{label}" if reliable else "unknown",
-                        role=self.settings.speaker_class_roles[label] if reliable else "unknown",
+                        speaker_id=speaker_id,
+                        role=role,
                     )
                 )
         return spans
 
-    def _classify(self, audios):
+    def _role(self, label, confidence, similarity, samples, reference):
+        roles = self.settings.speaker_class_roles
+        role = roles[label] if confidence >= MIN_CONFIDENCE else "unknown"
+        if reference is not None and samples >= MIN_MATCH_SAMPLES:
+            threshold = reference.match_threshold
+            # Require a stronger match to override a confident caller prediction.
+            if similarity >= threshold + (0.03 if role == "caller" else 0):
+                operator_id = (
+                    f"speaker_{roles.index('operator')}"
+                    if "operator" in roles
+                    else "speaker_operator"
+                )
+                return operator_id, "operator"
+            if similarity < threshold - 0.10 and role == "operator":
+                return "unknown", "unknown"
+        return (
+            (f"speaker_{label}", role) if confidence >= MIN_CONFIDENCE else ("unknown", "unknown")
+        )
+
+    def _classify(self, audios, reference):
         import torch
+
+        with torch.inference_mode():
+            pooled, vectors = self._pool(audios, embed=reference is not None)
+            model, _ = self._runtime
+            scores, labels = model["classifier"](pooled).softmax(dim=-1).max(dim=-1)
+            similarities = (
+                (vectors @ reference.vector).tolist() if reference else [None] * len(audios)
+            )
+        return zip(labels.tolist(), scores.tolist(), similarities, strict=True)
+
+    def _pool(self, audios, *, embed):
+        import torch
+        from torch.nn.functional import normalize
 
         model, processor = self._runtime
         inputs = processor(
@@ -140,12 +235,13 @@ class Wav2Vec2Diarizer:
             return_tensors="pt",
         )
         encoder = model["wav2vec2"]
-        with torch.inference_mode():
-            hidden = encoder(**inputs).last_hidden_state
-            mask = encoder._get_feature_vector_attention_mask(
-                hidden.shape[1], inputs.attention_mask
-            )
-            mask = mask.unsqueeze(-1).to(hidden.dtype)
-            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
-            scores, labels = model["classifier"](pooled).softmax(dim=-1).max(dim=-1)
-        return zip(labels.tolist(), scores.tolist(), strict=True)
+        hidden = encoder(**inputs).last_hidden_state
+        mask = encoder._get_feature_vector_attention_mask(hidden.shape[1], inputs.attention_mask)
+        mask = mask.unsqueeze(-1).to(hidden.dtype)
+        count = mask.sum(dim=1).clamp(min=1.0)
+        pooled = (hidden * mask).sum(dim=1) / count
+        if not embed:
+            return pooled, None
+        std = ((((hidden - pooled.unsqueeze(1)) * mask).square()).sum(dim=1) / count).sqrt()
+        centered_std = std - std.mean(dim=-1, keepdim=True)
+        return pooled, normalize(torch.cat([normalize(pooled), normalize(centered_std)], dim=-1))

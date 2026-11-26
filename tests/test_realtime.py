@@ -13,6 +13,7 @@ from app.examples import example_analysis
 from app.main import create_app
 from app.models.koelectra import KoElectraClassifier
 from app.models.placeholders import SpeakerModel, SpeechModel, SymptomModel
+from app.models.wav2vec2_speakers import Wav2Vec2Diarizer
 from app.providers.whisper import WhisperTranscriber
 from app.realtime import RealtimeSession
 from app.schemas import StreamStart, Symptom, Transcript
@@ -36,6 +37,59 @@ def begin(ws):
     ready = ws.receive_json()
     assert ready["type"] == "ready"
     return ready
+
+
+def test_operator_voice_sample_has_session_scope_and_stays_out_of_transcription(backend):
+    diarizer = Wav2Vec2Diarizer(backend.service.settings)
+    reference = object()
+    enrollment = []
+    states = []
+
+    def enroll(audio):
+        enrollment.append(audio.pcm)
+        return reference
+
+    def diarize(audio, state):
+        states.append(state.get("operator_voice_reference"))
+        return FakeDiarizer().diarize(audio, state)
+
+    diarizer.enroll_operator = enroll
+    diarizer.diarize = diarize
+    backend.service.diarizer = diarizer
+    assert backend.client.get("/api/v1/analysis/config").json()["operator_voice_sample_supported"]
+
+    for with_sample in (True, False):
+        with backend.client.websocket_connect(PATH) as ws:
+            ws.send_json({"type": "start", "operator_voice_sample": with_sample})
+            if with_sample:
+                prompt = ws.receive_json()
+                assert prompt["type"] == "operator_voice_sample_required"
+                assert len(prompt["sentences"]) == 3
+                for _ in range(8):
+                    ws.send_bytes(PCM)
+                ws.send_json({"type": "operator_voice_sample_end"})
+            assert ws.receive_json()["type"] == "ready"
+            ws.send_bytes(PCM)
+            ws.send_json({"type": "finish"})
+            while (event := ws.receive_json())["type"] != "finished":
+                assert event["type"] == "update", event
+            assert event["windows_processed"] == 1
+            assert event["duration_seconds"] == 0.5
+
+    assert enrollment == [PCM * 8]
+    assert states == [reference, None]
+    assert [audio.pcm for audio, _ in backend.transcriber.calls] == [PCM, PCM]
+
+
+def test_short_operator_sample_is_rejected_before_transcription(backend):
+    backend.service.diarizer = Wav2Vec2Diarizer(backend.service.settings)
+    with backend.client.websocket_connect(PATH) as ws:
+        ws.send_json({"type": "start", "operator_voice_sample": True})
+        assert ws.receive_json()["type"] == "operator_voice_sample_required"
+        ws.send_bytes(PCM)
+        ws.send_json({"type": "operator_voice_sample_end"})
+        assert ws.receive_json()["error"]["code"] == "OPERATOR_VOICE_TOO_SHORT"
+    assert not backend.transcriber.calls
 
 
 def test_whisper_transcript_is_sent_before_slow_speaker_and_keeps_same_sequence(settings):

@@ -74,10 +74,6 @@ RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니�
         "score": null
       }
     ],
-    "urgency": {
-      "level": "critical",
-      "reason": "쓰러짐과 호흡 없음 의심이 함께 보고되었습니다."
-    },
     "recommended_questions": [
       {
         "question": "환자가 있는 정확한 위치는 어디인가요?",
@@ -127,8 +123,7 @@ RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니�
 | `is_demo` | boolean |
 | `transcript` | 전사 텍스트·언어·길이·시간 구간·화자·제공자 |
 | `transcript.segments[].speaker` | `caller`, `operator`, `unknown` |
-| `analysis` | 상황 요약·증상·긴급도·확인 질문 객체; 실시간 처리 중 또는 실패 시 `null` |
-| `analysis.urgency.level` | `minimal`(최하), `low`(하), `moderate`(중), `high`(상), `critical`(최상). 판단에 필요한 정보가 부족하면 `unknown`(판단 보류) |
+| `analysis` | 상황 요약·증상·확인 질문 객체. 실시간 처리 중 또는 실패 시 `null` |
 | `analysis.recommended_questions` | `{question: string, purpose: string}` 배열. RAG는 0~3개, 기존 Gemini 경로는 1~5개 |
 | `symptoms` | `{code, label, evidence, score}` 배열, 최대 10개; 완료 시 `analysis.symptoms`와 동일 |
 | `symptoms[].code` | KoELECTRA는 `fever`, `nausea_vomiting`, `headache`, `abdominal_pain`, `dizziness`, `laceration`, `general_weakness`, `breathing_difficulty` 반환. 기존 코드 `collapse`, `suspected_no_breathing`, `altered_consciousness`, `chest_pain`, `bleeding`, `seizure`, `burn`, `trauma`, `other`도 허용 |
@@ -179,8 +174,17 @@ RAG 요청·응답 필드와 실행 예시는 [RAG 문서](RAG.md)에 있습니�
 | `sample_rate` | X | `16000`(고정·기본) |
 | `channels` | X | `1`(고정·기본) |
 | `language` | X | `ko`(기본), `en`, `ja`, `auto` |
+| `operator_voice_sample` | X | `false`(기본). `true`면 통화 전 상담원 음성 등록 요청 |
 
 `ready` 응답 이후 binary message로 16 kHz, mono, signed PCM16 little-endian을 연속 전송합니다. 권장 프레임은 100ms(3,200바이트), 최대는 1초(32,000바이트)이며 파일 헤더와 base64는 포함하지 않습니다.
+
+상담원 음성 등록은 `GET /api/v1/analysis/config`가 `operator_voice_sample_supported=true`를 반환할 때 사용할 수 있습니다.
+
+1. 시작 메시지에 `"operator_voice_sample": true`를 포함합니다.
+2. 서버가 `operator_voice_sample_required` 이벤트로 `sentences`, `min_speech_seconds`, `max_sample_seconds`, `max_frame_bytes`를 반환합니다. 상담원 한 명이 안내 문장을 읽는 동안 같은 PCM 형식으로 전송합니다. 샘플은 최대 20초이며, 실제 발화가 최소 4초 필요합니다.
+3. `{"type":"operator_voice_sample_end"}`를 보냅니다. 서버의 `ready`를 받은 뒤 통화 음성 전송을 시작합니다.
+
+등록 음성은 전사·요약·질문 추천 입력과 통화 길이 계산에서 제외합니다. 특징 벡터는 해당 WebSocket에서만 사용합니다. 등록을 요청하지 않으면 시작 메시지 뒤에 바로 `ready`가 옵니다. 지원하지 않는 모델은 `OPERATOR_VOICE_UNAVAILABLE`, 짧거나 발화가 부족한 샘플은 `OPERATOR_VOICE_TOO_SHORT`, 길이 제한을 넘은 샘플은 `OPERATOR_VOICE_TOO_LONG`, 구간 간 음성 특징이 불일치하면 `OPERATOR_VOICE_INCONSISTENT`를 반환하고 연결을 닫습니다.
 
 녹음 종료 시 마지막 binary message 다음에 JSON text:
 
@@ -251,6 +255,7 @@ JSON text 메시지:
   "languages": ["ko", "en", "ja", "auto"],
   "transcriber": "faster-whisper",
   "diarizer": "speaker-not-connected",
+  "operator_voice_sample_supported": false,
   "symptom_classifier": "symptom-not-connected",
   "koelectra_symptom_labels": ["고열", "구토·오심", "두통", "복통", "어지러움", "열상", "전신쇠약", "호흡곤란"],
   "example_preview": {
@@ -289,7 +294,6 @@ JSON text 메시지:
 | `symptom_provider` | `example` |
 | `analysis_provider` | `example` |
 | `analysis.symptoms`, `symptoms` | 고열·구토·오심·두통 예시, 각각 `score=null` |
-| `analysis.urgency.level` | `unknown` |
 | `warnings` | 고정 예시 안내 및 담당자 검토·매뉴얼 미연결 안내 |
 
 ## 서버 상태 확인 — GET /api/v1/health
@@ -313,6 +317,4 @@ JSON text 메시지:
 `gemini_configured`는 키 입력 여부를 나타내는 boolean이며, 실제 모델 실행이나 외부 API 호출 성공 여부를 나타내지는 않습니다.
 
 
-기본 로컬 LLM은 `rag.summary`의 요약과 매뉴얼 질문 문구를 생성합니다. 규칙에 부합한 신고는 `rag.manual_urgency`에 `reference`(매뉴얼 분류, 원문, PDF 출처)와 `evidence`(신고 발화 인용)를 반환합니다. 일치하는 규칙이 없으면 필드는 null입니다. `rag.urgency.reason`에도 매뉴얼 판정이 포함되며 기존 5단계 호환 필드인 `level`과 `origin`은 각각 unknown과 unavailable로 반환됩니다. 즉시 확인 여부와 경고는 `rag.requires_immediate_operator_review`와 `rag.safety_alerts`에 포함됩니다.
-
-음성 상태 추정 계약은 제거했습니다. 응답과 설정에는 해당 필드가 없습니다. `rag.urgency.origin`은 llm 또는 unavailable이며, llm이 아닌 경우 5단계 결과를 표시하지 않습니다. 유효한 결과를 얻기 전의 분석 대기·미완료와 LLM이 정보 부족으로 반환한 unknown(판단 보류)을 구분합니다.
+기본 로컬 LLM은 `rag.summary`의 요약과 매뉴얼 질문 문구를 생성합니다. 매뉴얼의 즉시 확인 조건과 원문 출처는 `rag.requires_immediate_operator_review`와 `rag.safety_alerts`로 반환합니다. 기존 클라이언트 호환을 위해 `rag.classification_references`는 빈 배열을 반환합니다.

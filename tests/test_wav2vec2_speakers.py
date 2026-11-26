@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from app.audio import SAMPLE_RATE, AudioInput
@@ -50,9 +52,10 @@ def test_speaker_chunks_cover_long_speech_and_use_configured_roles(settings, mon
     diarizer = Wav2Vec2Diarizer(settings)
     monkeypatch.setattr(diarizer, "_load_checkpoint", object)
 
-    def classify(audios):
+    def classify(audios, reference):
+        assert reference is None
         assert [len(audio) for audio in audios] == [3 * SAMPLE_RATE] * 3
-        return [(0, 0.9), (1, 0.9), (0, 0.6)]
+        return [(0, 0.9, None), (1, 0.9, None), (0, 0.6, None)]
 
     monkeypatch.setattr(diarizer, "_classify", classify)
     spans = diarizer.diarize(AudioInput(b"\x01\x00" * 10 * SAMPLE_RATE), {})
@@ -76,3 +79,24 @@ def test_failed_checkpoint_is_not_reloaded_for_every_audio_window(settings, monk
     assert diarizer.diarize(audio, {}) is None
     assert diarizer.diarize(audio, {}) is None
     assert attempts == [1]
+
+
+@pytest.mark.parametrize(
+    ("label", "confidence", "similarity", "seconds", "expected"),
+    [
+        (1, 0.99, 0.95, 2, OPERATOR),
+        (1, 0.99, 0.86, 2, CALLER),
+        (1, 0.99, 0.95, 1, CALLER),
+        (1, 0.60, 0.80, 2, ("unknown", "unknown")),
+        (0, 0.99, 0.65, 2, ("unknown", "unknown")),
+    ],
+)
+def test_voice_reference_only_changes_roles_with_clear_evidence(
+    settings, label, confidence, similarity, seconds, expected
+):
+    settings.speaker_class_roles = ("operator", "caller")
+    diarizer = Wav2Vec2Diarizer(settings)
+    reference = SimpleNamespace(match_threshold=0.85)
+    assert (
+        diarizer._role(label, confidence, similarity, seconds * SAMPLE_RATE, reference) == expected
+    )

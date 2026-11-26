@@ -246,16 +246,8 @@ def test_schema_omits_complex_generation_constraints_but_keeps_fields_and_enums(
     serialized = json.dumps(schema)
     for keyword in ("minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems"):
         assert keyword not in serialized
-    assert schema["required"] == ["summary", "symptoms", "urgency", "recommended_questions"]
+    assert schema["required"] == ["summary", "symptoms", "recommended_questions"]
     assert "collapse" in schema["$defs"]["Symptom"]["properties"]["code"]["enum"]
-    assert schema["$defs"]["Urgency"]["properties"]["level"]["enum"] == [
-        "minimal",
-        "low",
-        "moderate",
-        "high",
-        "critical",
-        "unknown",
-    ]
 
 
 def test_simplified_generation_schema_does_not_relax_server_validation():

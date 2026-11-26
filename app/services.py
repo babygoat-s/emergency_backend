@@ -119,6 +119,19 @@ class AnalysisService:
         self._classifier_slots = asyncio.Semaphore(1)
         self._estimator_slots = asyncio.Semaphore(1)
 
+    @property
+    def operator_voice_sample_supported(self) -> bool:
+        return isinstance(self.diarizer, Wav2Vec2Diarizer)
+
+    async def enroll_operator_voice(self, audio: AudioInput):
+        diarizer = self.diarizer
+        if not isinstance(diarizer, Wav2Vec2Diarizer):
+            raise ServiceError(
+                503, "OPERATOR_VOICE_UNAVAILABLE", "상담원 음성 등록을 지원하지 않습니다."
+            )
+        async with self.slot():
+            return await run_in_threadpool(diarizer.enroll_operator, audio)
+
     async def warm_models(self):
         models = []
         if isinstance(self.realtime_transcriber, WhisperTranscriber):
@@ -403,10 +416,6 @@ class AnalysisService:
                     Situation(
                         summary=result.rag.summary,
                         symptoms=result.symptoms,
-                        urgency={
-                            "level": result.rag.urgency.level,
-                            "reason": result.rag.urgency.reason,
-                        },
                         recommended_questions=result.local_questions,
                     )
                     if result.rag.summary

@@ -2,7 +2,7 @@ import re
 
 from pydantic import Field
 
-from app.rag.schemas import ConsultationState, Quote, RagModel, UrgencyProposal
+from app.rag.schemas import ConsultationState, Quote, RagModel
 
 
 class FactPatch(RagModel):
@@ -27,7 +27,6 @@ class Extraction(RagModel):
     summary: str = Field(default="", max_length=1500)
     summary_evidence: list[Quote] = Field(default_factory=list, max_length=10)
     questions: list[QuestionDraft] = Field(default_factory=list, max_length=3)
-    urgency: UrgencyProposal = Field(default_factory=UrgencyProposal)
 
 
 class Enrichment(RagModel):
@@ -37,7 +36,6 @@ class Enrichment(RagModel):
     questions: list[QuestionDraft] = Field(default_factory=list)
     status: str
     error_code: str | None = None
-    urgency: UrgencyProposal = Field(default_factory=UrgencyProposal)
     retry_after_seconds: float = 0
     model: str | None = None
 
@@ -109,31 +107,3 @@ def supported_summary(patch: Extraction, turns) -> str | None:
     if role_claim and not re.search(r"상담원|접수\s*담당자", evidence):
         return None
     return patch.summary.strip() if numbers_supported(patch.summary, evidence) else None
-
-
-def supported_urgency(patch: Extraction, turns) -> UrgencyProposal:
-    proposal = patch.urgency
-    if "urgency" not in patch.model_fields_set or "level" not in proposal.model_fields_set:
-        return UrgencyProposal(reason="LLM이 긴급도 분석 결과를 반환하지 않았습니다.")
-    if proposal.level == "unknown":
-        return proposal.model_copy(update={"origin": "llm"})
-    if not valid_quotes(proposal.evidence, turns):
-        return UrgencyProposal(reason="LLM 긴급도 제안에 유효한 대화 근거가 없습니다.")
-    evidence = reported_text(turns)
-    labels = {
-        "minimal": ("1", "최하"),
-        "low": ("2", "하"),
-        "moderate": ("3", "중"),
-        "high": ("4", "상"),
-        "critical": ("5", "최상"),
-    }
-    ordinal, label = labels[proposal.level]
-    reason = re.sub(
-        rf"긴급도(?:는|의|를)?\s*(?:5\s*단계\s*중\s*)?{ordinal}\s*(?:단계|레벨)"
-        rf"(?:\s*[(（]{label}[)）])?",
-        f"긴급도 {label}",
-        proposal.reason,
-    )
-    if not numbers_supported(reason, evidence):
-        return UrgencyProposal(reason="LLM 제안의 대화 근거가 부족해 다시 확인해야 합니다.")
-    return proposal.model_copy(update={"origin": "llm", "reason": reason})

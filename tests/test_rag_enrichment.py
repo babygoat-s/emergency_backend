@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnableLambda
 
 from app.config import Settings
 from app.rag.chain import GroundedChain
-from app.rag.enrichment import Extraction, question_text, supported_summary, supported_urgency
+from app.rag.enrichment import Extraction, question_text, supported_summary
 from app.rag.llm import SYSTEM, RagLLM, error_details, response_schema
 from app.rag.schemas import ConsultationState, RagResult, Turn
 
@@ -50,71 +50,14 @@ def test_summary_requires_literal_evidence_and_no_unsupported_numbers():
     assert supported_summary(patch, turns) is None
 
 
-def test_operator_question_cannot_ground_summary_or_urgency():
+def test_operator_question_cannot_ground_summary():
     turns = [Turn(id="0", speaker="operator", text="숨을 쉽니까?")]
     patch = Extraction(
         summary="호흡 상태가 확인되었습니다.",
         summary_evidence=[{"turn_id": "0", "quote": turns[0].text}],
-        urgency={
-            "level": "minimal",
-            "reason": "호흡이 정상입니다.",
-            "evidence": [{"turn_id": "0", "quote": turns[0].text}],
-        },
     )
     assert supported_summary(patch, turns) is None
-    assert supported_urgency(patch, turns).level == "unknown"
     assert supported_summary(Extraction(summary="근거 없는 요약"), turns) is None
-
-
-def test_grounded_urgency_proposal_keeps_level_and_evidence():
-    turns = [Turn(id="0", speaker="caller", text="두통과 구토가 심해지고 있어요.")]
-    patch = Extraction(
-        urgency={
-            "level": "high",
-            "reason": "두통과 구토가 심해진다는 보고가 있어 빠른 확인이 필요합니다.",
-            "evidence": [{"turn_id": "0", "quote": turns[0].text}],
-        }
-    )
-    proposal = supported_urgency(patch, turns)
-    assert proposal.level == "high"
-    assert proposal.origin == "llm"
-    patch.urgency.reason = "확인되지 않은 40도 발열이 있습니다."
-    assert supported_urgency(patch, turns).level == "unknown"
-
-
-@pytest.mark.parametrize(
-    "reason",
-    [
-        "35세 환자가 두통을 보고해 신속한 확인이 필요합니다.",
-        "긴급도는 5단계 중 3단계(중)로, 보고된 두통의 확인이 필요합니다.",
-        "119 상담에서 보고된 두통의 확인이 필요합니다.",
-    ],
-)
-def test_known_numbers_and_service_labels_do_not_force_llm_urgency_to_unknown(reason):
-    turns = [
-        Turn(id="0", speaker="caller", text="환자는 35살입니다."),
-        Turn(id="1", speaker="caller", text="두통을 호소해요."),
-    ]
-    patch = Extraction(
-        urgency={
-            "level": "moderate",
-            "reason": reason,
-            "evidence": [{"turn_id": "1", "quote": "두통을 호소해요."}],
-        }
-    )
-    result = supported_urgency(patch, turns)
-    assert result.level == "moderate"
-    assert result.origin == "llm"
-    patch.urgency.reason = "환자의 체온이 40도입니다."
-    assert supported_urgency(patch, turns).origin == "unavailable"
-    patch.urgency.reason = "혈압이 119라고 보고되었습니다."
-    assert supported_urgency(patch, turns).origin == "unavailable"
-    patch.urgency.reason = "심박수가 119입니다."
-    assert supported_urgency(patch, turns).origin == "unavailable"
-
-
-def test_missing_urgency_is_not_presented_as_an_llm_decision():
-    assert supported_urgency(Extraction(), []).origin == "unavailable"
 
 
 def test_summary_checks_all_reported_numbers_but_rejects_unreported_operator_presence():

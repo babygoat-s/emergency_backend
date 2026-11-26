@@ -69,6 +69,7 @@ async def config(service: Service):
         "languages": ["ko", "en", "ja", "auto"],
         "transcriber": service.transcriber.name,
         "diarizer": service.diarizer.name,
+        "operator_voice_sample_supported": service.operator_voice_sample_supported,
         "symptom_classifier": service.classifier.name,
         "koelectra_symptom_labels": list(LABEL_CODES),
         "example_preview": {

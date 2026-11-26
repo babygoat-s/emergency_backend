@@ -14,9 +14,9 @@ FastAPI 기반 음성 분석 및 매뉴얼 근거 후속 질문 추천 서버입
 | 증상 추출 | KoELECTRA 체크포인트를 설정하면 파일과 실시간에 적용 |
 | 후속 질문 | 로컬 매뉴얼이 후보를 선택하고 로컬 LLM이 문구를 보완. 분석 완료 후 검증된 질문만 표시 |
 | 상담 요약 | 로컬 LLM이 발화에 근거한 한 문장 요약 생성 |
-| 긴급도 | 확인된 신고 내용이 규칙과 일치하면 매뉴얼 분류와 근거 반환. 즉시 확인 경고는 별도로 표시 |
+| 매뉴얼 확인 경고 | 대화에서 확인이 필요한 원문 위험 조건과 출처 반환 |
 | 상담 상태 | 확인됨·미확인·불확실, 대화 증거와 화자 보존 |
-| 화자 분류 | Wav2Vec2 체크포인트를 설정하면 전사에 신고자·접수 담당자 역할을 표시 |
+| 화자 분류 | Wav2Vec2로 신고자와 상담원을 구분. 실시간 세션 시작 전에 상담원 음성을 선택적으로 등록 |
 | 매뉴얼 검색 | PyMuPDF 표 추출, 한국어 multilingual-e5-small 임베딩, Chroma 메타데이터 필터·의미 검색 |
 | LLM | `RAG_LLM_PROVIDER=openai_compatible`, `RAG_LLM_MODEL=qwen3.5:4b`, `LLM_PRIVACY_MODE=local_only` |
 
@@ -134,7 +134,7 @@ REST와 WebSocket의 서버 처리 오류 `message`는 일반 안내 문구로 �
 
 `app/models/koelectra.py`에서 체크포인트를 불러와 증상을 분류합니다. `Speaker Diarization.pth`를 `models`에 배치하고 `SPEAKER_MODEL_PATH="models/Speaker Diarization.pth"`와 `SPEAKER_CLASS_ROLES=["operator","caller"]`를 설정하면 Wav2Vec2로 화자를 분류합니다. 사용자 정의 화자 모델은 `DIARIZER_FACTORY`로 연결합니다. `TRANSCRIBER_FACTORY`로 별도 STT를 연결할 수 있습니다.
 
-화자 결과가 없거나 전사에 여러 화자 구간이 겹치면 해당 화자는 `unknown`입니다. 고정 예시는 `is_demo=true`, 제공자는 `example`입니다.
+화자 구간이 여러 개 겹치면 전사와 겹친 시간이 가장 긴 화자를 사용합니다. 신뢰할 수 있는 구간이 없으면 `unknown`을 반환합니다. 상담원 샘플 등록은 요청한 WebSocket 세션의 화자 분류에만 사용합니다. [실시간 API 명세](docs/API.md#실시간-음성-분석--websocket-apiv1analysisrealtime)에 PCM 전송 순서가 있습니다.
 
 원본 음성은 로컬 Whisper에서 처리합니다. 전사·상담 상태는 같은 기기의 Ollama에 전달하며, 백엔드의 `local_only` 정책은 외부 엔드포인트를 차단합니다. 업로드는 multipart 파서의 OS 임시 파일을 거칠 수 있고 요청 종료 시 닫습니다. 분석 결과는 메모리에서 처리합니다.
 
@@ -147,5 +147,3 @@ REST와 WebSocket의 서버 처리 오류 `message`는 일반 안내 문구로 �
 ```
 
 자동 테스트는 실제 키와 모델 가중치 없이 실행하며 API·오디오 디코딩·PCM 처리·비동기 작업·SDK 요청 직렬화·오류 메시지 비노출을 확인합니다.
-
-기본 로컬 LLM은 요약과 질문 문구를 생성합니다. 현재 신고 내용이 구현된 원문 조건과 일치하면 `rag.manual_urgency`에 원문 분류·PDF 쪽수·발화 인용이 반환됩니다. 일치 조건이 없으면 분류를 보류합니다. 기존 화면은 `rag.urgency.reason`에서 분류와 근거를 표시합니다.

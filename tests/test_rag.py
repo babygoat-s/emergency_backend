@@ -19,7 +19,6 @@ from app.rag.schemas import (
     Observation,
     Source,
     Turn,
-    UrgencyProposal,
 )
 from app.rag.state import update_state
 from app.schemas import SpeakerSpan, Symptom
@@ -230,7 +229,7 @@ def test_urgent_report_returns_source_alert_without_waiting_for_llm(engine):
     assert result.safety_alerts[0].source.pdf_page == 8
     assert "지연시키지" in result.message
     assert asyncio.run(engine.refine(turns, result)).llm_status == "disabled"
-    assert result.urgency.level == "unknown"
+    assert "urgency" not in result.model_dump()
 
 
 def test_source_question_answer_updates_dynamic_field_and_enables_branch(engine):
@@ -404,68 +403,23 @@ def test_syncope_rewrite_must_ask_about_patient_state(engine):
     assert question.source_excerpt == chunk.text
 
 
-@pytest.mark.parametrize(
-    ("protocol", "category", "criterion", "report", "matches"),
-    [
-        ("P08", "긴급", "무의식 혹은 무호흡", "지금 숨을 전혀 쉬지 않습니다.", True),
-        ("P08", "긴급", "무의식 혹은 무호흡", "숨을 안 쉬는 건 아니에요.", False),
-        ("P08", "긴급", "무의식 혹은 무호흡", "숨을 안 쉬면 어떻게 해요", False),
-        ("P08", "긴급", "무의식 혹은 무호흡", "저는 숨을 못 쉬겠어요.", False),
-        ("P08", "긴급", "호흡 여부가 불명확", "숨을 쉬는지 모르겠어요.", True),
-        ("P08", "긴급", "호흡 여부가 불명확", "숨을 정상적으로 쉬는지 모르겠어요.", False),
-        ("P03", "긴급", "구토가 동반된 두통", "머리가 아프고 계속 토해요.", True),
-        ("P03", "긴급", "구토가 동반된 두통", "머리가 아프고 토하지 않아요.", False),
-        (
-            "P03",
-            "긴급",
-            "구토가 동반된 두통",
-            "환자가 2명이고 한 명은 머리가 아프고 다른 한 명은 토해요.",
-            False,
-        ),
-        (
-            "P29",
-            "응급",
-            "지혈된 열상",
-            "찢어진 상처는 지혈됐어요. 의식은 또렷하고 호흡은 정상입니다.",
-            True,
-        ),
-        ("P29", "응급", "지혈된 열상", "찢어진 상처는 지혈됐어요.", False),
-    ],
-)
-def test_manual_urgency_uses_confirmed_current_report_and_source(
-    engine, protocol, category, criterion, report, matches
-):
-    engine.settings.rag_llm_provider = "openai_compatible"
-    engine.settings.rag_llm_compact_request = True
+def test_indexed_classification_is_not_exposed_as_an_assessment(engine):
     engine._store.chunks.append(
         ManualChunk(
             id="classification",
             source=engine._store.chunks[0].source.model_copy(
-                update={"protocol_id": protocol, "question_id": None}
+                update={"protocol_id": "P03", "question_id": None}
             ),
             protocol_name="fixture",
             kind="classification",
-            text=criterion,
-            source_category=category,
+            text="구토가 동반된 두통",
+            source_category="긴급",
             order=0,
         )
     )
-    previous = ConsultationState(
-        fields={
-            "breathing": Observation(
-                status="confirmed", value="absent", turn_id="0", evidence=report
-            )
-        }
-    )
-    result = engine.recommend([caller(report)], previous=previous, semantic=False)
-    if matches:
-        assert result.manual_urgency.reference.category == category
-        assert result.manual_urgency.reference.text == criterion
-        assert all(quote.quote in report for quote in result.manual_urgency.evidence)
-        assert category in result.urgency.reason
-    else:
-        assert result.manual_urgency is None
-    assert result.urgency.origin == "unavailable"
+    body = engine.recommend([caller("머리가 아프고 계속 토해요.")]).model_dump()
+    assert body["classification_references"] == []
+    assert "urgency" not in body and "manual_urgency" not in body
 
 
 def test_operator_questions_are_not_facts_and_answer_respects_polarity(engine):
@@ -526,7 +480,7 @@ def test_no_candidate_and_missing_index_have_explicit_status(engine, tmp_path):
     assert result.questions == []
 
 
-def test_missing_index_does_not_disable_llm_summary_and_urgency(tmp_path):
+def test_missing_index_does_not_disable_llm_summary(tmp_path):
     engine = RagEngine(Settings(_env_file=None, rag_data_dir=str(tmp_path)))
     turns = [caller("머리가 아파요.")]
     calls = []
@@ -537,7 +491,6 @@ def test_missing_index_does_not_disable_llm_summary_and_urgency(tmp_path):
             state=result.state,
             status="completed",
             summary="두통이 보고되었습니다.",
-            urgency=UrgencyProposal(level="moderate", reason="LLM 제안", origin="llm"),
         )
 
     engine._llm = SimpleNamespace(enrich=enrich)
@@ -545,7 +498,6 @@ def test_missing_index_does_not_disable_llm_summary_and_urgency(tmp_path):
     assert result.status == "index_unavailable"
     assert result.questions == []
     assert result.summary_provider == "llm"
-    assert result.urgency.level == "moderate"
     assert calls == [{}]
 
 
@@ -947,11 +899,6 @@ def test_text_api_returns_llm_summary_and_grounded_contextual_questions(backend,
                 "protocol_order": [],
                 "summary": "환자가 두통을 호소합니다.",
                 "summary_evidence": [{"turn_id": "0", "quote": "머리가 아파요."}],
-                "urgency": {
-                    "level": "moderate",
-                    "reason": "두통을 호소해 신속한 상태 확인이 필요합니다.",
-                    "evidence": [{"turn_id": "0", "quote": "머리가 아파요."}],
-                },
                 "questions": [
                     {
                         "candidate_id": "consciousness",
@@ -977,7 +924,7 @@ def test_text_api_returns_llm_summary_and_grounded_contextual_questions(backend,
     assert body["summary"] == "환자가 두통을 호소합니다."
     assert body["summary_provider"] == "llm"
     assert body["questions"][0]["selection_origin"] == "llm_rewrite"
-    assert body["urgency"]["level"] == "moderate"
+    assert "urgency" not in body and "manual_urgency" not in body
 
 
 def test_rag_503_recovers_after_finish_without_stopping_transcription(backend, engine):
@@ -1020,7 +967,7 @@ def test_rag_503_recovers_after_finish_without_stopping_transcription(backend, e
     assert len(calls) == 2
 
 
-def test_urgency_uses_llm_proposal_without_local_level_override(engine):
+def test_llm_summary_keeps_manual_safety_alerts(engine):
     turns = [caller("의식이 없고 숨을 안 쉬어요.")]
     original = engine.recommend(turns)
 
@@ -1032,18 +979,17 @@ def test_urgency_uses_llm_proposal_without_local_level_override(engine):
             state=state,
             status="completed",
             summary="요약",
-            urgency=UrgencyProposal(level="high", reason="LLM이 제안한 단계", origin="llm"),
         )
 
     engine._llm = SimpleNamespace(enrich=enrich)
     refined = asyncio.run(engine.refine(turns, original))
-    assert refined.urgency.level == "high"
+    assert refined.summary_provider == "llm"
     assert refined.requires_immediate_operator_review
     assert refined.safety_alerts == original.safety_alerts
     assert len(refined.questions) <= 1
 
 
-def test_voice_completion_uses_llm_urgency_and_summary(backend, engine):
+def test_voice_completion_uses_llm_summary(backend, engine):
     from app.schemas import AnalysisResponse, Transcript
 
     async def enrich(turns, result, context):
@@ -1051,9 +997,6 @@ def test_voice_completion_uses_llm_urgency_and_summary(backend, engine):
             state=result.state,
             status="completed",
             summary="두통이 악화된다는 신고입니다.",
-            urgency=UrgencyProposal(
-                level="high", reason="보고된 증상 악화의 확인이 필요합니다.", origin="llm"
-            ),
         )
 
     engine._llm = SimpleNamespace(enrich=enrich, close=AsyncMock())
@@ -1065,7 +1008,7 @@ def test_voice_completion_uses_llm_urgency_and_summary(backend, engine):
     )
     result = asyncio.run(backend.service.complete(original))
     assert result.analysis.summary == result.rag.summary
-    assert result.analysis.urgency.level == result.rag.urgency.level == "high"
+    assert "urgency" not in result.analysis.model_dump()
 
 
 def test_remaining_raw_questions_get_one_bounded_rewrite_without_losing_summary(engine):
@@ -1093,7 +1036,6 @@ def test_remaining_raw_questions_get_one_bounded_rewrite_without_losing_summary(
         return json.dumps(
             {
                 "summary": "환자가 두통을 호소합니다.",
-                "urgency": {"level": "unknown", "reason": "추가 확인 필요", "origin": "llm"},
                 "summary_evidence": [{"turn_id": "0", "quote": "머리가 아파요."}],
                 "questions": [],
             }

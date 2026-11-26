@@ -10,14 +10,8 @@ import httpx
 from app.errors import ServiceError
 from app.privacy import is_loopback_endpoint, prepare_llm_payload, require_llm_destination
 from app.providers.gemini import gemini_error_reason, gemini_response_schema
-from app.rag.enrichment import (
-    Enrichment,
-    Extraction,
-    report_statements,
-    supported_summary,
-    supported_urgency,
-)
-from app.rag.schemas import Observation, UrgencyProposal
+from app.rag.enrichment import Enrichment, Extraction, report_statements, supported_summary
+from app.rag.schemas import Observation
 from app.rag.state import apply_observation
 
 logger = logging.getLogger(__name__)
@@ -66,24 +60,12 @@ reason에는 현재 무엇이 미확인인지, 해당 매뉴얼 질문과 어떤
 facts에서 새로 확인된 항목을 제외하고 source_candidates의 순서대로 최대 3개를 작성한다.
 후보별로 최대 1개이며 근거가 부족하면 생략한다. 출동·응급처치를 지연시키지 않는다.
 
-4. urgency: 이 서비스의 검토용 5단계 제안이다. PDF의 긴급/응급/비응급과 동일시하거나
-자동 대응표를 만들지 않는다. 출동 결정·의학적 확정 판단을 하지 않는다.
-minimal(최하)은 경미한 증상과 안정 상태가 확인된 경우,
-low(하)는 안정적이나 지속·변화를 확인할 경우,
-moderate(중)는 보고된 뚜렷한 증상·상태 변화로 신속한 확인이 필요한 경우,
-high(상)는 보고된 중대한 이상·빠른 악화가 의심되는 경우,
-critical(최상)은 보고된 즉각적인 생명 위험이 의심되는 경우다.
-주소·연락처 등 행정 정보가 미확인인 것만으로 unknown으로 만들지 않는다.
-환자 상태를 판단할 발화 근거가 없을 때만 unknown을 사용하고 부족한 내용을 reason에 적는다.
-reason에 실제 보고된 상태와 불확실성을 설명하고 evidence에 turn_id·원문 quote를 넣는다.
-reason에는 단계 번호나 분류 체계 설명 대신, 보고된 상태에 관한 이유를 작성한다.
-증상 모델의 추정이나 상담원의 질문을 확정 사실로 쓰지 않는다. origin은 llm이다.
 requires_immediate_operator_review가 true면 추가 질문 생성은 생략하고 요약·근거 정리만 한다.
 task가 rewrite_questions_only면 서버가 검증한 미확인 후보만 전달한 것이다.
 이때 후보를 다시 생략하지 말고 모든 source_candidates에 구체적인 question만 작성한다.
-facts/protocol_order/summary_evidence는 빈 배열, summary는 빈 문자열, urgency는 unknown으로 둔다.
+facts/protocol_order/summary_evidence는 빈 배열, summary는 빈 문자열로 둔다.
 
-출력은 facts, protocol_order, summary, summary_evidence, questions, urgency를 가진 JSON 하나다.
+출력은 facts, protocol_order, summary, summary_evidence, questions를 가진 JSON 하나다.
 """
 
 COMPACT_SYSTEM = """
@@ -228,8 +210,6 @@ class RagLLM:
         provider = self.settings.rag_llm_provider
         compact = provider == "openai_compatible" and self.settings.rag_llm_compact_request
         fallback = Enrichment(state=state, status="disabled")
-        if compact:
-            fallback.urgency = UrgencyProposal.operator_review()
         if provider == "disabled":
             return fallback
         try:
@@ -285,10 +265,6 @@ class RagLLM:
                 q.source.question_id: {"text": q.source_excerpt, "field": q.field}
                 for q in candidates
             },
-            "manual_classification_context": [
-                {"text": item.text, "category": item.category}
-                for item in result.classification_references[:8]
-            ],
         }
         try:
 
@@ -305,7 +281,6 @@ class RagLLM:
                     state=state,
                     questions=patch.questions,
                     status="completed",
-                    urgency=fallback.urgency,
                     model=self._last_model,
                 )
             lookup = {t.id: t for t in turns}
@@ -356,26 +331,18 @@ class RagLLM:
             self.retry_delay = 0
             self._last_error = None
             summary = supported_summary(patch, turns)
-            urgency = fallback.urgency if compact else supported_urgency(patch, turns)
-            complete = bool(summary) and (compact or urgency.origin == "llm")
             error = None
-            if not complete:
-                if not patch.summary.strip():
-                    error = "SUMMARY_EMPTY"
-                elif not summary:
-                    error = "SUMMARY_UNGROUNDED"
-                else:
-                    error = "URGENCY_UNGROUNDED"
+            if not summary:
+                error = "SUMMARY_UNGROUNDED" if patch.summary.strip() else "SUMMARY_EMPTY"
                 logger.info("RAG LLM incomplete (provider=%s, reason=%s)", provider, error)
             return Enrichment(
                 state=state,
                 ranking=[p for p in patch.protocol_order if p in state.protocol_ids],
                 summary=summary,
                 questions=patch.questions,
-                status="completed" if complete else "partial",
+                status="completed" if summary else "partial",
                 error_code=error,
-                retry_after_seconds=0 if complete or compact else 5,
-                urgency=urgency,
+                retry_after_seconds=0 if summary or compact else 5,
                 model=self._last_model,
             )
         except Exception as exc:

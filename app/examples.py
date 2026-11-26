@@ -62,10 +62,6 @@ def example_analysis() -> AnalysisResponse:
         analysis=Situation(
             summary="신고자가 39도 발열과 구토, 두통을 호소했습니다.",
             symptoms=symptoms,
-            urgency={
-                "level": "unknown",
-                "reason": "증상이 시작된 시각과 현재 상태를 추가로 확인해야 합니다.",
-            },
             recommended_questions=[
                 {"question": "환자가 있는 정확한 위치는 어디인가요?", "purpose": "현장 위치 확인"},
                 {"question": "열과 두통은 언제부터 시작됐나요?", "purpose": "증상 시작 시각 확인"},

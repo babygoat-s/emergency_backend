@@ -5,9 +5,11 @@ from contextlib import suppress
 
 from fastapi import WebSocket
 from starlette.concurrency import run_in_threadpool
+from starlette.websockets import WebSocketDisconnect
 
 from app.audio import BYTES_PER_SECOND, AudioInput
 from app.errors import ServiceError
+from app.models.wav2vec2_speakers import MAX_OPERATOR_SAMPLE_SECONDS, MIN_OPERATOR_SPEECH_SECONDS
 from app.providers.whisper import WhisperTranscriber
 from app.rag.engine import field_answered
 from app.rag.question_bank import estimate_question_is_open
@@ -26,6 +28,15 @@ PAUSE_CHECK_INTERVAL_BYTES = BYTES_PER_SECOND // 4
 STT_CONTEXT_BYTES = 6 * BYTES_PER_SECOND
 CATCH_UP_CONTEXT_BYTES = 2 * BYTES_PER_SECOND
 logger = logging.getLogger(__name__)
+
+
+def pcm_frame(message):
+    pcm = message.get("bytes") or b""
+    if not pcm or len(pcm) % 2:
+        raise ServiceError(422, "INVALID_PCM", "PCM16은 비어 있지 않은 짝수 바이트여야 합니다.")
+    if len(pcm) > BYTES_PER_SECOND:
+        raise ServiceError(413, "FRAME_TOO_LARGE", "PCM은 1초 이하 프레임으로 전송하세요.")
+    return pcm
 
 
 class RealtimeSession:
@@ -72,6 +83,8 @@ class RealtimeSession:
             await self.ws.send_json(message)
 
     async def run(self):
+        if self.start.operator_voice_sample:
+            await self.receive_operator_sample()
         await self.send(
             {
                 "type": "ready",
@@ -111,13 +124,58 @@ class RealtimeSession:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self.raw_pcm.clear()
+            self.speaker_state.clear()
+
+    async def receive_operator_sample(self):
+        if not self.service.operator_voice_sample_supported:
+            raise ServiceError(
+                503, "OPERATOR_VOICE_UNAVAILABLE", "상담원 음성 등록을 지원하지 않습니다."
+            )
+        await self.send(
+            {
+                "type": "operator_voice_sample_required",
+                "sentences": [
+                    "안녕하세요. 제 목소리가 잘 들리나요?",
+                    "천천히 말씀해 주시면 제가 듣고 확인하겠습니다.",
+                    "준비가 되면 이어서 말씀해 주세요.",
+                ],
+                "min_speech_seconds": MIN_OPERATOR_SPEECH_SECONDS,
+                "max_sample_seconds": MAX_OPERATOR_SAMPLE_SECONDS,
+                "max_frame_bytes": BYTES_PER_SECOND,
+            }
+        )
+        buffer = bytearray()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.settings.ws_idle_timeout_seconds
+        while True:
+            message = await asyncio.wait_for(self.ws.receive(), timeout=deadline - loop.time())
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            if (raw := message.get("text")) is not None:
+                if len(raw) > 4096 or json.loads(raw) != {"type": "operator_voice_sample_end"}:
+                    raise ServiceError(
+                        422,
+                        "INVALID_STREAM_MESSAGE",
+                        "operator_voice_sample_end 메시지가 필요합니다.",
+                    )
+                break
+            buffer.extend(pcm_frame(message))
+            if len(buffer) > MAX_OPERATOR_SAMPLE_SECONDS * BYTES_PER_SECOND:
+                raise ServiceError(
+                    413, "OPERATOR_VOICE_TOO_LONG", "샘플은 20초 이하로 녹음해 주세요."
+                )
+        if len(buffer) < MIN_OPERATOR_SPEECH_SECONDS * BYTES_PER_SECOND:
+            raise ServiceError(
+                422, "OPERATOR_VOICE_TOO_SHORT", "상담원 음성이 4초 이상 필요합니다."
+            )
+        self.speaker_state["operator_voice_reference"] = await self.service.enroll_operator_voice(
+            AudioInput(pcm=bytes(buffer))
+        )
 
     def enqueue_audio(self, pcm: bytes, offset: float):
         self.audio_queue.put_nowait(AudioInput(pcm=pcm, start_seconds=offset))
 
     async def receive_audio(self):
-        from starlette.websockets import WebSocketDisconnect
-
         buffer = bytearray()
         offset = 0.0
         detect_pause = (
@@ -142,13 +200,7 @@ class RealtimeSession:
                     await self.audio_queue.put(AudioInput(pcm=bytes(buffer), start_seconds=offset))
                 await self.audio_queue.put(None)
                 return
-            pcm = message.get("bytes") or b""
-            if not pcm or len(pcm) % 2:
-                raise ServiceError(
-                    422, "INVALID_PCM", "PCM16은 비어 있지 않은 짝수 바이트여야 합니다."
-                )
-            if len(pcm) > BYTES_PER_SECOND:
-                raise ServiceError(413, "FRAME_TOO_LARGE", "PCM은 1초 이하 프레임으로 전송하세요.")
+            pcm = pcm_frame(message)
             self.total_bytes += len(pcm)
             if self.total_bytes / BYTES_PER_SECOND > self.settings.max_audio_seconds:
                 raise ServiceError(413, "STREAM_LIMIT", "최대 실시간 음성 길이를 초과했습니다.")
@@ -616,7 +668,7 @@ class RealtimeSession:
             self.speakers_finished.set()
 
     async def process_live_rules(self):
-        last_warning = (False, None)
+        last_warning = False
         while (item := await self.rules_queue.get()) is not None:
             sequence, window, snapshot = item
             result = snapshot.model_copy()
@@ -624,7 +676,7 @@ class RealtimeSession:
             await self.service.prepare_rag(result, semantic=False)
             if result.rag is None or self.recording_stopped.is_set():
                 continue
-            warning = (result.rag.requires_immediate_operator_review, result.rag.manual_urgency)
+            warning = result.rag.requires_immediate_operator_review
             if warning != last_warning:
                 last_warning = warning
                 await self.send_update("audio", sequence, window, result)

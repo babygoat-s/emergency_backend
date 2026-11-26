@@ -5,7 +5,6 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 RESEARCH_NOTICE = (
     "오래된 첨부 매뉴얼을 사용하는 연구용 의사결정 지원 프로토타입입니다. "
     "의료 전문가 검증 전 실제 응급상황에 사용하지 마세요. "
-    "긴급·응급·비응급은 과거 원문의 연구용 분류입니다. "
     "실제 출동 판단은 담당자 확인이 필요합니다."
 )
 
@@ -67,21 +66,6 @@ class Quote(RagModel):
     quote: str = Field(min_length=1, max_length=1000)
 
 
-class UrgencyProposal(RagModel):
-    level: Literal["minimal", "low", "moderate", "high", "critical", "unknown"] = "unknown"
-    reason: str = Field(
-        default="LLM 긴급도 분석 결과를 기다리고 있습니다.",
-        min_length=1,
-        max_length=1500,
-    )
-    evidence: list[Quote] = Field(default_factory=list, max_length=10)
-    origin: Literal["llm", "unavailable"] = "unavailable"
-
-    @classmethod
-    def operator_review(cls):
-        return cls(reason="긴급도는 상담원이 직접 판단합니다.")
-
-
 class Recommendation(RagModel):
     question: str
     reason: str
@@ -98,12 +82,6 @@ class Recommendation(RagModel):
 class Reference(RagModel):
     text: str
     source: Source
-    category: Literal["긴급", "응급", "비응급"] | None = None
-
-
-class ManualUrgency(RagModel):
-    reference: Reference
-    evidence: list[Quote]
 
 
 class RagResult(RagModel):
@@ -111,6 +89,7 @@ class RagResult(RagModel):
     state: ConsultationState
     questions: list[Recommendation] = Field(default_factory=list, max_length=3)
     safety_alerts: list[Reference] = Field(default_factory=list)
+    # The existing client reads .length on this field.
     classification_references: list[Reference] = Field(default_factory=list)
     instruction_references: list[Reference] = Field(default_factory=list)
     requires_immediate_operator_review: bool = False
@@ -123,8 +102,6 @@ class RagResult(RagModel):
     summary: str | None = None
     summary_provider: Literal["llm", "pending", "unavailable", "disabled", "extractive"] = "pending"
     questions_status: Literal["completed", "unavailable", "not_needed"] | None = None
-    urgency: UrgencyProposal = Field(default_factory=UrgencyProposal)
-    manual_urgency: ManualUrgency | None = None
     retry_after_seconds: float = 0
     llm_model: str | None = None
     _candidates: list[Recommendation] = PrivateAttr(default_factory=list)
